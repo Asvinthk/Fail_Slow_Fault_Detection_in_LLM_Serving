@@ -26,10 +26,18 @@
    the effective factor `1 + w(t)*(1/fraction - 1)`. This slows the
    real SEND/RECV, so the prefill iteration, TTFT and sender
    occupancy grow. Models only the bandwidth term, not latency.
-   Measured: 2x inflation on example_trace (2-22 tok prompts) -> +0.0% clocks,
-   1 audit record. Negative result: tiny transfers are invisible
-   at ns resolution; a transfer-heavy workload (long prompts) is
-   needed to calibrate 2x/4x scaling. Not claimed until measured.
+   Calibration (1 request, 2048-token prompt, 256 MB KV):
+   - link 16 GB/s: healthy 255189132 ns; 2x and 4x both identical.
+     The receiver-side transfer overlaps sender compute (sender
+     ~200 ms vs transfer ~16 ms), so inflation is fully hidden.
+   - link 1 GB/s (`pd_1p1d_slowlink.json`): healthy 423217485 ns
+     (+66% vs normal link); 2x -> 673217485 ns (+250 ms, +59%);
+     4x -> 1173217485 ns (+750 ms, +177%). Linear in
+     (1/fraction - 1) as the bandwidth term predicts.
+   Rule: the fault bites only when transfer time is comparable to
+   prefill compute (slow link or short compute). On a fast link with
+   compute-dominated prefill it is correctly neutral, and the audit
+   (comm sums exactly doubled) proves the bytes were inflated.
 
 3. `kv_handoff_delay`
    Hook: Router-side held queue in `__main__` with release times.
@@ -56,10 +64,16 @@
 5. `worker_stall`
    Hook: router skips stalled instances, `schedule` guarded in
    `__main__`. In-flight batches complete; queued requests wait.
-   Non-DP only; `dp_group` + faults raises a clear error.
-   Near-stop fail-slow (factor 10+) is provided for
-   crash-vs-fail-slow comparison. Real crash with loss is out
-   of scope.
+   Transfers to a stalled decode are HELD in the router and retried
+   after recovery, never dropped (an early version silently lost one
+   request per all-stalled window: 9/10 completed; fixed and
+   unit-tested). Non-DP only; `dp_group` + faults raises a clear
+   error. Measured (10 reqs, decode-1 stalled 1-5 s): makespan
+   5657635463 ns (+3.996 s, the window), audit 1 stall-window record
+   (3987 skipped polls), telemetry 0 batches on instance 1 in-window
+   and 10/10 requests completed. Near-stop fail-slow (factor 10+) is
+   provided for crash-vs-fail-slow comparison. Real crash with loss
+   is out of scope.
 
 ## Timing semantics
 

@@ -143,6 +143,15 @@ def run_one(repo_root, out_root, job, seed, timeout, keep_inputs, commit):
             fault_path = os.path.join(pair_dir, "fault_%s.json" % suffix)
             with open(fault_path, "w") as f:
                 json.dump({"faults": [resolved]}, f, indent=2)
+        # serving chdir's into astra-sim/, so repo-relative paths need the
+        # same ".." prefix as the dataset/cluster flags (--inputs-root is
+        # resolved with os.path.abspath against the sim cwd).
+        inputs_rel = os.path.join("experiments", "out", pair_id,
+                                  "inputs_%s" % suffix)
+        if os.path.isabs(out_root):
+            inputs_arg = os.path.join(out_root, pair_id, "inputs_%s" % suffix)
+        else:
+            inputs_arg = os.path.join("..", inputs_rel)
         cmd = [sys.executable, "-m", "serving",
                "--cluster-config", job["cluster"],
                "--dtype", "bfloat16", "--block-size", "16",
@@ -150,8 +159,7 @@ def run_one(repo_root, out_root, job, seed, timeout, keep_inputs, commit):
                "--output", os.path.relpath(csv_path, repo_root),
                "--num-reqs", str(len(open(workload_path).readlines())),
                "--run-id", run_id,
-               "--inputs-root", os.path.join("experiments", "out", pair_id,
-                                             "inputs_%s" % suffix),
+               "--inputs-root", inputs_arg,
                "--telemetry-output", os.path.relpath(telemetry_dir, repo_root)]
         if fault_path is not None:
             cmd += ["--fault-config", os.path.relpath(fault_path, repo_root)]
