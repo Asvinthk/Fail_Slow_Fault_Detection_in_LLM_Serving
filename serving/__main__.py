@@ -396,7 +396,14 @@ def main():
             load_fault_config, severity_weight, fault_matches,
             is_stalled, apply_to_trace_rows,
         )
-        fault_manager = load_fault_config(args.fault_config)
+        # The sim chdir'd into astra-sim/ above, so repo-relative paths
+        # need the same ".." prefix as the cluster config and dataset.
+        fault_config_path = args.fault_config
+        if not os.path.isabs(fault_config_path):
+            fault_config_path = os.path.join("..", fault_config_path)
+        fault_manager = load_fault_config(fault_config_path)
+        if args.telemetry_output is not None and not os.path.isabs(args.telemetry_output):
+            args.telemetry_output = os.path.join("..", args.telemetry_output)
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -1351,8 +1358,20 @@ def main():
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
 
     if fault_manager is not None:
-        audit_path = os.path.join(run_paths.inputs_root, "injection_audit.jsonl")
-        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+        # inputs_root is deleted after a successful run unless
+        # --keep-inputs, so the audit must live somewhere persistent:
+        # next to --telemetry-output if given, else next to --output.
+        if args.telemetry_output is not None:
+            audit_dir = args.telemetry_output
+        elif output_file is not None:
+            # save_output prefixes "../" for repo-relative paths; match it.
+            audit_dir = os.path.dirname(output_file) or "."
+            if not os.path.isabs(audit_dir):
+                audit_dir = os.path.join("..", audit_dir)
+        else:
+            audit_dir = run_paths.inputs_root
+        os.makedirs(audit_dir, exist_ok=True)
+        audit_path = os.path.join(audit_dir, "injection_audit.jsonl")
         with open(audit_path, "w") as f:
             for entry in fault_audit:
                 f.write(json.dumps(entry) + "\n")

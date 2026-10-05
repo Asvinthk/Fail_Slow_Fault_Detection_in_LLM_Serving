@@ -203,9 +203,12 @@ def apply_to_trace_rows(faults, rows, role, instance_id, now_s):
         applied_comp = 0
         nominal_comm = 0
         applied_comm = 0
-        for row in rows:
-            if len(row) != 11:
+        for idx, old_row in enumerate(rows):
+            if len(old_row) != 11:
                 continue
+            # Trace rows are tuples; copy to a list before scaling.
+            row = list(old_row)
+            rows[idx] = row
             layer = row[COL_LAYER]
             if mode in ("compute_multiplicative", "compute_additive", "network_degradation"):
                 old = int(row[COL_COMP_TIME])

@@ -58,6 +58,18 @@ def test_multiplicative_scales_target_only():
     assert other[0][1] == "1000"
 
 
+def test_tuple_rows_are_copied_before_scaling():
+    # generate_trace builds rows as tuples; scaling must not crash.
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    faults = [{"fault_id": "f1", "target": {"role": "decode", "instance_id": 1},
+               "injection_layer": "mechanism", "mode": "compute_multiplicative",
+               "factor": 2.0, "schedule": schedule}]
+    rows = [tuple(make_row(comp=1000))]
+    audits = apply_to_trace_rows(faults, rows, "decode", 1, 5.0)
+    assert rows[0][1] == "2000"
+    assert audits[0]["applied"] is True
+
+
 def test_additive_delta():
     schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
     faults = [{"fault_id": "f1", "target": {"role": "prefill", "instance_id": 0},
