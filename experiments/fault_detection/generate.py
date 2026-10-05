@@ -122,7 +122,9 @@ def run_one(repo_root, out_root, job, seed, timeout, keep_inputs, commit):
     # One workload file shared by the healthy and faulty twins.
     workload_path = os.path.join(pair_dir, "workload.jsonl")
     if not os.path.exists(workload_path):
-        rows = generate_workload(seed=seed, **job["workload"])
+        workload_params = dict(job["workload"])
+        workload_params["seed"] = seed
+        rows = generate_workload(**workload_params)
         with open(workload_path, "w") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
