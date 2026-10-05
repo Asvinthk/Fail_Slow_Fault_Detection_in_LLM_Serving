@@ -52,6 +52,10 @@ pd_per_instance_config 1661784496
 pd_sharegpt 12851061128
 moe_pd 2081236210
 heterogeneous 21800606937
+pd_fault_decode_mult 2318421829
+pd_fault_transfer_bw 1661594628
+pd_fault_handoff 1661127254
+pd_fault_stall 5657635463
 pim 1643150716
 pim_sub_batch 2634096516
 power 1663996645
