@@ -70,6 +70,17 @@ class Request:
         self.session_id = None
         self.sub_request_index = None
 
+        # Observable telemetry stamps for PD-disaggregated runs. All
+        # initialized here (never via getattr fallbacks). -1 means the
+        # event has not happened yet. These feed request_telemetry.csv
+        # only; the original --output CSV schema is unchanged.
+        self.prefill_instance_id = -1
+        self.decode_instance_id = -1
+        self.first_scheduled_ns = -1
+        self.prefill_done_ns = -1
+        self.decode_admit_ns = -1
+        self.first_decode_done_ns = -1
+
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 

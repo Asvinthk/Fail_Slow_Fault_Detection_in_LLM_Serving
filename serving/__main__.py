@@ -62,7 +62,7 @@ def _pad_batch_to_max(batch, max_len):
     batch.num_decode += pad              # counted for lm_head / dense shape
 
 
-def _pass_response(router, current, state_changed=False):
+def _pass_response(router, current, state_changed=False, fault_faults=None, held=None):
     """The "pass" answer, carrying the next known arrival when there is one.
 
     ASTRA-Sim stops re-asking an NPU that passed until either some NPU
@@ -80,13 +80,35 @@ def _pass_response(router, current, state_changed=False):
     of them is preceded by a report, so nothing else would lift the
     suppression. ASTRA-Sim treats it like a workload assignment: this NPU
     stays askable and every other one is re-opened too.
+
+    Fault wake-ups: when fault_faults is given, fault start/end times and
+    held-handoff release times are also wake-up events -- an all-idle
+    cluster must wake at them, otherwise a stall window or handoff hold
+    is slept past. With both extra args None the deadline is exactly the
+    arrival deadline as before (disabled-by-default path unchanged).
     """
     if state_changed:
         return "pass -1"
+    candidates = []
     nxt = router.get_next_pending_arrival()
-    if nxt is None or nxt <= current:
+    if nxt is not None and nxt > current:
+        candidates.append(int(nxt))
+    if held:
+        for release_ns, _ in held:
+            if release_ns > current:
+                candidates.append(int(release_ns))
+    if fault_faults:
+        now_s = current / 1e9
+        for fault in fault_faults:
+            schedule = fault.get("schedule", {})
+            for key in ("start_s", "end_s"):
+                if key in schedule:
+                    bound_ns = int(schedule[key] * 1e9)
+                    if bound_ns > current:
+                        candidates.append(bound_ns)
+    if not candidates:
         return "pass"
-    return f"pass {int(nxt)}"
+    return f"pass {min(candidates)}"
 
 
 def _runtime_limit(value):
@@ -391,6 +413,10 @@ def main():
     fault_audit = []
     held_transfers = []
     batch_telemetry = []
+    # Batch shape snapshot at schedule time, keyed (instance_id, batch_id).
+    # add_done only sees (id, sys, finish), so the shape observed at
+    # scheduling is remembered here to fill the telemetry row at completion.
+    batch_meta = {}
     if args.fault_config is not None:
         from serving.core.fault_injection import (
             load_fault_config, severity_weight, fault_matches,
@@ -713,6 +739,8 @@ def main():
                 still_held = []
                 for release_ns, req in held_transfers:
                     if release_ns <= current:
+                        if args.telemetry_output is not None and req.decode_admit_ns == -1:
+                            req.decode_admit_ns = release_ns
                         router.transfer_prefill_request([req])
                     else:
                         still_held.append((release_ns, req))
@@ -740,7 +768,18 @@ def main():
         prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
         if args.telemetry_output is not None:
             com = out_dict.get('com_cycle', 0) if out_dict is not None else 0
-            batch_telemetry.append((args.run_id, instance_id, id, current, current, 0, 0, 0, com))
+            meta = batch_meta.get((instance_id, id))
+            if meta is None:
+                batch_telemetry.append((args.run_id, instance_id, id, sys, current, current,
+                                        0, 0, 0, 0, 0, 0, 0, 0, com))
+            else:
+                duration = current - meta["batch_time_ns"]
+                batch_telemetry.append((args.run_id, instance_id, id, sys,
+                                        meta["batch_time_ns"], current, duration,
+                                        meta["num_prefill"], meta["num_decode"],
+                                        meta["total_len"], meta["kv_len"],
+                                        meta["pd_kv_send_tokens"],
+                                        meta["n_waiting"], meta["n_running"], com))
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -753,6 +792,20 @@ def main():
         if instances[instance_id]["pd_type"] != "prefill":
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
+
+        # Observable request-stage stamps for request_telemetry.csv.
+        # Guarded by the telemetry flag so the disabled path is untouched.
+        if args.telemetry_output is not None:
+            if instances[instance_id]["pd_type"] == "prefill":
+                for req in finished_reqs:
+                    req.prefill_instance_id = instance_id
+                    if req.prefill_done_ns == -1:
+                        req.prefill_done_ns = current
+            elif len(finished_reqs) > 0:
+                for req in finished_reqs:
+                    req.decode_instance_id = instance_id
+                    if req.first_decode_done_ns == -1:
+                        req.first_decode_done_ns = current
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
@@ -778,8 +831,16 @@ def main():
                                         "time_ns": current, "delay_ns": handoff_delay,
                                         "count": len(finished_reqs)})
                 else:
+                    if args.telemetry_output is not None:
+                        for req in finished_reqs:
+                            if req.decode_admit_ns == -1:
+                                req.decode_admit_ns = current
                     router.transfer_prefill_request(finished_reqs, skip_decode_ids=stalled_decode)
             else:
+                if args.telemetry_output is not None:
+                    for req in finished_reqs:
+                        if req.decode_admit_ns == -1:
+                            req.decode_admit_ns = current
                 router.transfer_prefill_request(finished_reqs)
 
         # An NPU that opened a DP round owes ASTRA-Sim that round's graph, and it
@@ -1037,6 +1098,20 @@ def main():
                             entry.update({"batch_id": new_req.batch_id, "instance": instance_id,
                                           "time_ns": current})
                             fault_audit.append(entry)
+                    if args.telemetry_output is not None:
+                        for req in new_req.requests:
+                            if req.first_scheduled_ns == -1:
+                                req.first_scheduled_ns = current
+                        batch_meta[(instance_id, new_req.batch_id)] = {
+                            "batch_time_ns": current,
+                            "num_prefill": new_req.num_prefill,
+                            "num_decode": new_req.num_decode,
+                            "total_len": new_req.total_len,
+                            "kv_len": new_req.kv_len,
+                            "pd_kv_send_tokens": new_req.pd_kv_send_tokens,
+                            "n_waiting": len(schedulers[instance_id].waiting),
+                            "n_running": len(schedulers[instance_id].running),
+                        }
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1241,18 +1316,34 @@ def main():
             # advance current time so the next iteration can pick them up.
             # Built before the jump below: _pass_response compares against
             # the clock ASTRA-Sim is actually at, not the one we skip to.
-            pass_msg = _pass_response(router, current)
+            pass_faults = fault_manager["faults"] if fault_manager is not None else None
+            pass_msg = _pass_response(router, current, fault_faults=pass_faults,
+                                      held=held_transfers if fault_manager is not None else None)
             if router.has_deferred_sessions() or router.has_pending_requests():
                 next_arrival = router.get_next_pending_arrival()
                 if next_arrival is not None and next_arrival > current:
                     current = next_arrival
-            if fault_manager is not None and held_transfers:
-                # Wake an idle cluster at the next handoff release time.
-                # Without this an all-idle run sleeps past the release and hangs.
-                next_release = min(release for release, _ in held_transfers)
-                if next_release > current:
-                    current = next_release
-                pass_msg = "pass %d" % int(current)
+            if fault_manager is not None:
+                wake = []
+                if held_transfers:
+                    # Wake an idle cluster at the next handoff release time.
+                    # Without this an all-idle run sleeps past the release and hangs.
+                    wake.append(min(release for release, _ in held_transfers))
+                # Fault start/end times are wake-up events too: a stall
+                # window ending while the cluster is idle must wake it,
+                # otherwise recovery is never observed.
+                for fault in fault_manager["faults"]:
+                    schedule = fault.get("schedule", {})
+                    for key in ("start_s", "end_s"):
+                        if key in schedule:
+                            bound_ns = int(schedule[key] * 1e9)
+                            if bound_ns > current:
+                                wake.append(bound_ns)
+                if wake:
+                    nxt_wake = min(wake)
+                    if nxt_wake > current:
+                        current = nxt_wake
+                    pass_msg = "pass %d" % int(current)
             controller.write_flush(p, pass_msg)
         
         # flush
@@ -1380,9 +1471,42 @@ def main():
         os.makedirs(args.telemetry_output, exist_ok=True)
         batch_path = os.path.join(args.telemetry_output, "batch_telemetry.csv")
         with open(batch_path, "w") as f:
-            f.write("run_id,instance_id,batch_id,batch_time_ns,finish_ns,duration_ns,num_prefill,num_decode,total_len\n")
+            f.write("run_id,instance_id,batch_id,sys,batch_time_ns,finish_ns,duration_ns,"
+                    "num_prefill,num_decode,total_len,kv_len,pd_kv_send_tokens,"
+                    "n_waiting,n_running,com_cycle\n")
             for row in batch_telemetry:
                 f.write(",".join(str(v) for v in row) + "\n")
+        # Per-request observable telemetry. Ground truth (fault ids,
+        # manifest labels) is never written here -- only absolute event
+        # stamps and latency stats derived from the requests themselves.
+        req_path = os.path.join(args.telemetry_output, "request_telemetry.csv")
+        itl_path = os.path.join(args.telemetry_output, "request_itls.jsonl")
+        with open(req_path, "w") as f, open(itl_path, "w") as g:
+            f.write("request_id,prefill_instance_id,decode_instance_id,"
+                    "input_toks,output_toks,arrival_ns,first_scheduled_ns,"
+                    "prefill_done_ns,decode_admit_ns,first_decode_done_ns,"
+                    "ttft_ns,latency_ns,queuing_delay_ns,tpot,"
+                    "itl_count,itl_mean_ns,itl_p50_ns,itl_p99_ns,itl_max_ns\n")
+            for sched in schedulers:
+                for req in sched.done:
+                    itls = sorted(req.itl) if req.itl else []
+                    n = len(itls)
+                    if n == 0:
+                        mean = p50 = p99 = mx = -1
+                    else:
+                        mean = sum(itls) // n
+                        p50 = itls[min(n - 1, int(0.50 * n))]
+                        p99 = itls[min(n - 1, int(0.99 * n))]
+                        mx = itls[-1]
+                    f.write(",".join(str(v) for v in (
+                        req.id, req.prefill_instance_id, req.decode_instance_id,
+                        req.original_input, req.output, req.arrival,
+                        req.first_scheduled_ns, req.prefill_done_ns,
+                        req.decode_admit_ns, req.first_decode_done_ns,
+                        req.ttft, req.latency, req.queuing_delay, req.tpot,
+                        n, mean, p50, p99, mx)) + "\n")
+                    g.write(json.dumps({"request_id": req.id,
+                                        "itl_ns": list(req.itl)}) + "\n")
         print(f"Telemetry written to: {args.telemetry_output}")
 
     # --save-trace-text writes the text into the run directory, so keeping it

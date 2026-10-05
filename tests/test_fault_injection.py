@@ -177,3 +177,37 @@ def test_stall_and_validation():
                                             "schedule": schedule}]})
     with pytest.raises(ValueError):
         validate_fault_config({"faults": [], "bogus_key": 1})
+
+
+class _StubRouter:
+    def __init__(self, nxt=None):
+        self._nxt = nxt
+
+    def get_next_pending_arrival(self):
+        return self._nxt
+
+
+def test_pass_response_unchanged_without_faults():
+    from serving.__main__ import _pass_response
+    router = _StubRouter(nxt=5_000_000_000)
+    assert _pass_response(router, 1_000_000_000) == "pass 5000000000"
+    assert _pass_response(_StubRouter(), 1_000_000_000) == "pass"
+
+
+def test_pass_response_wakes_at_fault_boundaries_and_holds():
+    from serving.__main__ import _pass_response
+    router = _StubRouter(nxt=None)
+    faults = [{"fault_id": "s1", "target": {"role": "decode", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "worker_stall",
+               "schedule": {"start_s": 2.0, "end_s": 4.0, "profile": "step"}}]
+    # Fault start (2e9 ns) is the earliest wake-up.
+    assert _pass_response(router, 1_000_000_000,
+                          fault_faults=faults, held=[]) == "pass 2000000000"
+    # A handoff release earlier than the fault end wins.
+    held = [(2_500_000_000, object())]
+    assert _pass_response(router, 1_000_000_000,
+                          fault_faults=faults, held=held) == "pass 2000000000"
+    # A past handoff release never drags the deadline backwards;
+    # the next wake-up is the fault end.
+    assert _pass_response(router, 3_000_000_000,
+                          fault_faults=faults, held=held) == "pass 4000000000"
