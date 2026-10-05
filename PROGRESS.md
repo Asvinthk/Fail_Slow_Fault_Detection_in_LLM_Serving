@@ -21,6 +21,9 @@ lives in `docs/fault_injection/RUNLOG.md`.
 - [x] Stage 5 ML baselines (features.py observable-only + healthy residuals
   + peer ratios; run.py thresholds/residual/logistic, grouped splits,
   abstaining localization, delay + CSV/markdown report).
-- [ ] Stage 6 final verification (full validate.sh green incl. 4 new fault
-  scenarios; smoke matrix end-to-end; ML report on smoke data) -- needs the
-  sim container (ASTRA-Sim binary); pending on this host.
+- [x] Stage 6 final verification (2026-10-05, container):
+  full validate.sh clocks 58/58 PASS + 4 new pd_fault_* baselines
+  recorded; pytest 21 passed (19 injection + ML/guard tests, container
+  + host); smoke matrix 3 pairs / 5 runs / 0 failed, clocks reproduce;
+  ML report on smoke (40 windows) written. Fixture workloads deleted
+  after use (regeneratable per RUNLOG); no large artifacts committed.

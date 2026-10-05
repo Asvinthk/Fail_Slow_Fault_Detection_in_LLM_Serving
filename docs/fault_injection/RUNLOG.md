@@ -56,9 +56,7 @@
 
 - `python -m pytest tests/ -q` -> 18 passed (15 fault-injection +
   3 fault-ML: feature isolation guard, residual fit, observable-leak
-  guard). Binary-dependent runs were not attempted on this host;
-  full `./serving/validate.sh` (incl. 4 new `pd_fault_*` scenarios)
-  and the smoke matrix remain container steps.
+  guard). Binary-dependent runs were not attempted on this host.
 - Fault-semantics fixes (all covered by new unit tests):
   1. `compute_additive` was per-layer; now per-iteration (last serial
      row only). Multi-row test pins applied == nominal + delta.
@@ -77,6 +75,59 @@
   (was FileNotFoundError traceback before the fix).
 - New validate.sh scenarios (`pd_fault_decode_mult`,
   `pd_fault_transfer_bw`, `pd_fault_handoff`, `pd_fault_stall`) added;
-  baselines must be recorded in-container via
-  `./serving/validate.sh --update pd_fault_decode_mult` (etc.).
-  Not run here: no ASTRA-Sim binary on this host (Windows).
+  baselines recorded in-container (see container session below).
+
+## Container session (servingsim_docker, ASTRA-Sim analytical binary)
+
+All runs: `--dtype bfloat16 --block-size 16`, PD config
+`single_node_pd_instance.json` unless noted, exit 0 throughout.
+Headline: healthy 1661784496 ns (x3 identical runs, two CSV md5
+`d88e5e4a...` identical); telemetry on/off identical clocks + CSV.
+
+- decode_mult 1.5x -> 1989969195 (+19.8%), 59 audits.
+- decode_mult 2.0x -> 2318421829 (+39.5%), 59 audits, per-batch comp
+  exactly doubled (sums 656787414 -> 1313574828); x3 identical runs.
+  Pre-fix record 2318732875 differs 0.013% (fault-boundary wake-ups;
+  per-batch injection unchanged).
+- additive +10 ms/iter -> 2251594628 (+35.5%), audit delta exactly
+  10000000 ns on all 59 records (per-iteration, not per-layer).
+- transfer_half_bw on short trace -> 1661594628 (-0.01%), 1 audit
+  (655360 -> 1310720 B). Neutral: tiny KV hidden in iteration time.
+- handoff_100ms from 1 s -> 1661127254 (-0.04%), 1 hold (prefill
+  drains before onset; onset placement matters). Held request latency
+  +110 ms, TTFT unchanged.
+- handoff_100ms from 0 s -> 1761737862 (+6.0% = +100 ms makespan),
+  9 holds; every latency +99.9..+111.2 ms; mean TTFT +4.38 ms
+  (fault-active observer effect on batching, disclosed in DEVIATIONS).
+- decode_stall 1-5 s -> 5657635463 (+3.996 s = the window), 3987
+  skipped polls, 0 in-window batches, 10/10 requests (first attempt
+  lost 1 request to silent drop in transfer_prefill_request; fixed to
+  hold-and-retry, unit-tested, rerun confirms 10/10).
+- network_1.5x on tp=1 -> 1661594628, 60 audits with zero changed
+  bytes (no collective rows; now labeled applied=false, never silent).
+- Onset-miss control: transfer fault over [1 s, 30 s] on a 0.4 s run
+  -> clocks bit-identical, empty audit.
+- Transfer calibration (1 req, 2048 prompt, 256 MB KV): link 16 GB/s
+  healthy 255189132, 2x/4x identical (transfer overlaps sender
+  compute, fully hidden); link 1 GB/s (`pd_1p1d_slowlink.json`)
+  healthy 423217485 (+66%), 2x -> 673217485 (+250 ms),
+  4x -> 1173217485 (+750 ms): linear in (1/fraction - 1).
+- `./serving/validate.sh --clocks-only` (CR-stripped copy, LF
+  baselines copy): 58/58 existing PASS, 4 new scenarios NEW with the
+  values above; baselines recorded via `--update <name>` each.
+  (Container note: working-copy CRLF breaks bash scripts and the
+  baseline compare; strip CR in /tmp copies, never in the repo.)
+- Telemetry fixes from measured data: per-report logging duplicated
+  rows ~25x (ASTRA-Sim repeats finished lines) -> dedupe on
+  (instance, sys, id); shape via report id - 1 mapping; stall windows
+  emit skip-count summaries; healthy-run telemetry path prefix was
+  nested under --fault-config (misplaced into astra-sim/; fixed,
+  stray dir removed, data relocated, submodule clean).
+- Smoke matrix (`generate --profile smoke`): 3 pairs, 5 runs,
+  0 failed; faulty applied=True, healthy applied=False; clocks
+  reproduce across invocations. Pair-grouping fix: healthy twin used
+  to run twice per shared pair.
+- ML report on smoke (40 windows): fixed-threshold test P 1.000 /
+  R 0.556 FPR 0.000; residual-only P 0.857 / R 0.667 F1 0.750;
+  logistic P 0.286 / R 0.222 (overfits smoke scale, honest negative);
+  localization 0.475, abstention 0.075, delay 1.0 s (2 s floor).
