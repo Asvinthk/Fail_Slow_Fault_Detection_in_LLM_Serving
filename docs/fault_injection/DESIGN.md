@@ -9,15 +9,20 @@
    Scaling `comp_time` there changes what ASTRA-Sim executes.
    Integer-rounded because the converter requires int.
    MoE/PIM rows are scaled too when present; nothing special.
+   Measured (single_node_pd_instance, example_trace, 10 reqs):
+   healthy 1661784496 ns; decode-1 factor 2.0 -> 2318732875 ns
+   (+39.5%), audit 59 records all on instance 1 with comp sums
+   doubled (11092427 -> 22184854), reproducible on rerun.
 
 2. `kv_transfer_bandwidth`
    Hook: same function, `comm_size` on `qkv_proj` rows inflated by
    `1 / bandwidth_fraction`. This slows the real SEND/RECV, so the
    prefill iteration, TTFT and sender occupancy grow.
-   Models only the bandwidth term, not latency. Microbenchmark
-   (fixed workload, scale 2x/4x) should be recorded here once the
-   sim container is available; on this host the binary is missing
-   so no numbers are claimed.
+   Models only the bandwidth term, not latency. Measured: 2x
+   inflation on example_trace (2-22 tok prompts) -> +0.0% clocks,
+   1 audit record. Negative result: tiny transfers are invisible
+   at ns resolution; a transfer-heavy workload (long prompts) is
+   needed to calibrate 2x/4x scaling. Not claimed until measured.
 
 3. `kv_handoff_delay`
    Hook: Router-side held queue in `__main__` with release times.
