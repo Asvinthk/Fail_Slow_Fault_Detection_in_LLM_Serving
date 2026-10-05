@@ -111,11 +111,10 @@ def total_clocks_from_log(log_text):
     return -1
 
 
-def run_one(repo_root, out_root, job, seed, timeout, keep_inputs, commit):
+def run_one(repo_root, out_root, pair_id, job, faults, seed, timeout,
+            keep_inputs, commit):
     workload_id = job["workload_id"]
     cluster_id = job["cluster_id"]
-    fault = job["fault"]
-    pair_id = "%s_%s_%d" % (workload_id, cluster_id, seed)
     pair_dir = os.path.join(out_root, pair_id)
     os.makedirs(pair_dir, exist_ok=True)
 
@@ -130,10 +129,11 @@ def run_one(repo_root, out_root, job, seed, timeout, keep_inputs, commit):
                 f.write(json.dumps(row) + "\n")
 
     results = []
-    twins = [("healthy", None), ("faulty", fault)]
+    twins = [("healthy", None)]
+    for i, fault_spec in enumerate(faults):
+        twins.append(("faulty%d" % i if len(faults) > 1 else "faulty",
+                      fault_spec))
     for suffix, fault_spec in twins:
-        if fault_spec is None and job["fault"] is None and suffix == "faulty":
-            continue  # healthy-only pair entry
         run_id = "%s_%s" % (pair_id, suffix)
         telemetry_dir = os.path.join(pair_dir, "%s_telemetry" % suffix)
         os.makedirs(telemetry_dir, exist_ok=True)
@@ -254,18 +254,26 @@ def main():
                 done_pairs.add((entry["pair_id"], entry["run_id"]))
 
     commit = git_commit(repo_root)
-    pending = [j for j in jobs if not (
-        ("%s_%s_%d" % (j["workload_id"], j["cluster_id"], args.seed),
-         "%s_%s_%d_%s" % (j["workload_id"], j["cluster_id"], args.seed,
-                          "faulty" if j["fault"] else "healthy")) in done_pairs)]
-    print("profile %s: %d jobs (%d pending)" % (args.profile, len(jobs), len(pending)))
+    # Group jobs by pair so the healthy twin runs once even when several
+    # matrix entries share a (workload, cluster, seed) pair.
+    pairs = {}
+    for job in jobs:
+        pair_id = "%s_%s_%d" % (job["workload_id"], job["cluster_id"], args.seed)
+        entry = pairs.setdefault(pair_id, {"job": job, "faults": []})
+        if job["fault"] is not None:
+            entry["faults"].append(job["fault"])
+    pending = [(pair_id, entry) for pair_id, entry in pairs.items()
+               if not any((pair_id, "%s_%s" % (pair_id, suffix)) in done_pairs
+                          for suffix in ["healthy"] + ["faulty%d" % i for i in range(len(entry["faults"]))])]
+    print("profile %s: %d pairs (%d pending)" % (args.profile, len(pairs), len(pending)))
 
     manifest_file = open(manifest_path, "a")
     failures = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        future_to_job = {pool.submit(run_one, repo_root, out_root, job, args.seed,
-                                     args.timeout, args.keep_inputs, commit): job
-                         for job in pending}
+        future_to_job = {pool.submit(run_one, repo_root, out_root, pair_id,
+                                     entry["job"], entry["faults"], args.seed,
+                                     args.timeout, args.keep_inputs, commit): pair_id
+                         for pair_id, entry in pending}
         for future in concurrent.futures.as_completed(future_to_job):
             try:
                 entries = future.result()
