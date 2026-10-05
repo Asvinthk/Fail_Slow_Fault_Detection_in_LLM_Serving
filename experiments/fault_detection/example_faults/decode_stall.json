@@ -1,0 +1,11 @@
+{
+    "faults": [
+        {
+            "fault_id": "decode1_stall",
+            "target": {"role": "decode", "instance_id": 1},
+            "injection_layer": "mechanism",
+            "mode": "worker_stall",
+            "schedule": {"start_s": 1.0, "end_s": 5.0, "profile": "step"}
+        }
+    ]
+}

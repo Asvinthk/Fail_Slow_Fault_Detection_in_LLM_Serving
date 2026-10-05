@@ -1,0 +1,12 @@
+{
+    "faults": [
+        {
+            "fault_id": "transfer_half_bw",
+            "target": {"role": "transfer", "instance_id": 0},
+            "injection_layer": "mechanism",
+            "mode": "kv_transfer_bandwidth",
+            "bandwidth_fraction": 0.5,
+            "schedule": {"start_s": 1.0, "end_s": 30.0, "profile": "step"}
+        }
+    ]
+}
