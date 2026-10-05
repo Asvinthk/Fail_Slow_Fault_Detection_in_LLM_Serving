@@ -1,0 +1,92 @@
+# Experiment matrix for fail-slow fault-detection research.
+# Paired runs: each (workload, cluster, seed) runs healthy then faulty
+# with identical arrivals and lengths; the pair shares a pair_id.
+# Workload parameters are sampled independently of fault parameters;
+# the matrix deliberately includes healthy-high-load and faulty-low-load
+# pairs so workload-vs-fault discrimination is tested, not assumed.
+#
+# Severity ladder: 1.1, 1.25, 1.5, 2.0 (multiplicative) plus additive
+# delta_ns values. Profiles: smoke (minutes) and full.
+
+workloads:
+  light_poisson: {pattern: poisson, num: 10, rate_sps: 1.0, seed: 11,
+                  short_in: 32, long_in: 128, short_out: 16, long_out: 64}
+  heavy_poisson: {pattern: poisson, num: 24, rate_sps: 8.0, seed: 12,
+                  short_in: 32, long_in: 512, short_out: 32, long_out: 256}
+  bursty: {pattern: bursty, num: 24, rate_sps: 8.0, seed: 13, on_s: 1.0, off_s: 2.0,
+           short_in: 32, long_in: 512, short_out: 32, long_out: 256}
+  sustained: {pattern: sustained, num: 16, rate_sps: 4.0, seed: 14,
+              short_in: 64, long_in: 256, short_out: 32, long_out: 128}
+  heldout_bursty: {pattern: bursty, num: 24, rate_sps: 6.0, seed: 99, on_s: 0.5, off_s: 3.0,
+                   short_in: 64, long_in: 384, short_out: 16, long_out: 192}
+
+clusters:
+  small_1p1d: configs/cluster/pd_1p1d_small.json
+  small_2p2d: configs/cluster/pd_2p2d_small.json
+
+# Fault templates. target instance ids follow cluster config order
+# (prefill 0..P-1, then decode). kv_transfer_* targets the prefill
+# instance's transfer path (per-pair targeting is not possible).
+fault_templates:
+  decode_mult_2x: {fault_id: decode_slow, target: {role: decode, instance_id: -1},
+                   injection_layer: mechanism, mode: compute_multiplicative,
+                   factor: 2.0, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+  prefill_mult_15x: {fault_id: prefill_slow, target: {role: prefill, instance_id: 0},
+                     injection_layer: mechanism, mode: compute_multiplicative,
+                     factor: 1.5, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+  transfer_bw_half: {fault_id: transfer_bw, target: {role: transfer, instance_id: 0},
+                     injection_layer: mechanism, mode: kv_transfer_bandwidth,
+                     bandwidth_fraction: 0.5,
+                     schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+  handoff_100ms: {fault_id: handoff, target: {role: transfer, instance_id: 0},
+                  injection_layer: mechanism, mode: kv_handoff_delay,
+                  delay_ns: 100000000,
+                  schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+  decode_stall: {fault_id: stall, target: {role: decode, instance_id: -1},
+                 injection_layer: mechanism, mode: worker_stall,
+                 schedule: {start_s: 2.0, end_s: 20.0, profile: step}}
+  network_15x: {fault_id: network, target: {role: network, instance_id: all},
+                injection_layer: mechanism, mode: network_degradation,
+                factor: 1.5, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+  decode_intermittent: {fault_id: decode_intermittent,
+                        target: {role: decode, instance_id: -1},
+                        injection_layer: mechanism, mode: compute_multiplicative,
+                        factor: 2.0,
+                        schedule: {start_s: 1.0, end_s: 60.0, profile: intermittent,
+                                   period_s: 4.0, duty: 0.5}}
+  decode_ramp: {fault_id: decode_ramp, target: {role: decode, instance_id: -1},
+                injection_layer: mechanism, mode: compute_multiplicative,
+                factor: 2.0,
+                schedule: {start_s: 1.0, end_s: 60.0, profile: ramp_up_down, ramp_s: 10.0}}
+  decode_additive: {fault_id: decode_additive, target: {role: decode, instance_id: -1},
+                    injection_layer: mechanism, mode: compute_additive,
+                    delta_ns: 50000000,
+                    schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
+
+profiles:
+  smoke:
+    clusters: [small_1p1d]
+    pairs:
+      - {workload: light_poisson, fault: decode_mult_2x}
+      - {workload: light_poisson, fault: null}
+      - {workload: heavy_poisson, fault: null}
+      - {workload: bursty, fault: handoff_100ms}
+  full:
+    clusters: [small_1p1d, small_2p2d]
+    pairs:
+      - {workload: light_poisson, fault: decode_mult_2x}
+      - {workload: light_poisson, fault: null}
+      - {workload: heavy_poisson, fault: null}
+      - {workload: heavy_poisson, fault: decode_mult_2x}
+      - {workload: bursty, fault: null}
+      - {workload: bursty, fault: handoff_100ms}
+      - {workload: sustained, fault: prefill_mult_15x}
+      - {workload: sustained, fault: transfer_bw_half}
+      - {workload: light_poisson, fault: network_15x}
+      - {workload: light_poisson, fault: decode_stall}
+      - {workload: bursty, fault: decode_intermittent}
+      - {workload: sustained, fault: decode_ramp}
+      - {workload: light_poisson, fault: decode_additive}
+      - {workload: light_poisson, fault: decode_mult_2x, severity_ladder: [1.1, 1.25, 1.5, 2.0]}
+      - {workload: heldout_bursty, fault: null}
+      - {workload: heldout_bursty, fault: decode_mult_2x}
