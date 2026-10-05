@@ -88,16 +88,22 @@ def check_observable_clean(telemetry_dir):
 
 
 def audit_within_interval(audit_records, fault):
-    """True if at least one audit record for fault_id is inside [start, end)."""
+    """True if an applied audit record for fault_id is inside [start, end)."""
     schedule = fault.get("schedule", {})
     start_ns = schedule.get("start_s", 0) * 1e9
     end_ns = schedule.get("end_s", float("inf")) * 1e9
+    visited = False
     for record in audit_records:
         if record.get("fault_id") != fault.get("fault_id"):
             continue
         time_ns = record.get("time_ns", 0)
         if start_ns <= time_ns < end_ns:
-            return True, ""
+            visited = True
+            if record.get("applied"):
+                return True, ""
+    if visited:
+        return False, ("records for %s are inside the window but applied=false "
+                       "(mechanism neutral for those batches)" % fault.get("fault_id"))
     return False, "no audit record for %s inside [%s, %s)s" % (
         fault.get("fault_id"), schedule.get("start_s"), schedule.get("end_s"))
 

@@ -280,7 +280,9 @@ def apply_to_trace_rows(faults, rows, role, instance_id, now_s):
                         new_comm = int(round(old_comm * eff))
                         row[COL_COMM_SIZE] = str(new_comm)
                         applied_comm += new_comm
-        audits.append({
+        changed = (applied_comp != nominal_comp
+                   or applied_comm != nominal_comm)
+        entry = {
             "fault_id": fault["fault_id"],
             "mode": mode,
             "weight": weight,
@@ -288,6 +290,13 @@ def apply_to_trace_rows(faults, rows, role, instance_id, now_s):
             "applied_comp_sum": applied_comp,
             "nominal_comm_sum": nominal_comm,
             "applied_comm_sum": applied_comm,
-            "applied": True,
-        })
+            "applied": changed,
+        }
+        if not changed:
+            # Active window, visited rows, but nothing to scale (e.g.
+            # network_degradation on a tp=1 trace has no collective rows).
+            # Never silently label it applied.
+            entry["note"] = ("no matching rows changed; mechanism neutral "
+                             "for this batch")
+        audits.append(entry)
     return audits
