@@ -68,5 +68,5 @@ class Controller():
                     com_cycle,
                 )
                 self.end_dict[sys] = id
-            return {'sys': sys, 'id': id, 'cycle': cycle}
+            return {'sys': sys, 'id': id, 'cycle': cycle, 'com_cycle': com_cycle}
         return

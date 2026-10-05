@@ -371,6 +371,12 @@ def main():
                         'halves KV cache memory. Override per instance with "kv_cache_dtype"')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--fault-config', type=str, default=None,
+                        help='path to JSON fault-injection config (simulator injection modes only). Absent = disabled, byte-identical.')
+    parser.add_argument('--fault-seed', type=int, default=42,
+                        help='seed for fault-injection randomness (currently unused, kept for reproducibility)')
+    parser.add_argument('--telemetry-output', type=str, default=None,
+                        help='directory for observable telemetry CSVs (batch/request). Original --output CSV is untouched.')
 
     args = parser.parse_args()
     
@@ -378,6 +384,19 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+
+    # Fault injection is disabled by default. When --fault-config is absent,
+    # fault_manager stays None and no new code path executes below.
+    fault_manager = None
+    fault_audit = []
+    held_transfers = []
+    batch_telemetry = []
+    if args.fault_config is not None:
+        from serving.core.fault_injection import (
+            load_fault_config, severity_weight, fault_matches,
+            is_stalled, apply_to_trace_rows,
+        )
+        fault_manager = load_fault_config(args.fault_config)
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -654,6 +673,9 @@ def main():
     # the first one's graph, and a single slot silently dropped the first.
     dp_ready_workloads = defaultdict(deque)  # npu_id -> deque[workload_path]
 
+    if fault_manager is not None and dp_groups:
+        raise ValueError("fault injection prototype does not support dp_group instances; use a PD config without dp_group")
+
     # ----------------------------------- Start simulation loop ------------------------------------
     print_markup("[sim.heading]▶ Starting simulation...[/]\n")
     flush.stdout.flush()
@@ -671,7 +693,25 @@ def main():
 
         # Route newly arrived requests to instances based on current load
         if dataset is not None:
-            router.route_arrived_requests(current)
+            if fault_manager is not None:
+                # Stalled prefill instances do not receive new arrivals;
+                # requests stay pending instead of being silently dropped.
+                stalled_prefill = set()
+                for inst in instances:
+                    if inst.get("pd_type") == "prefill":
+                        if is_stalled(fault_manager["faults"], "prefill", inst["instance_id"], current / 1e9):
+                            stalled_prefill.add(inst["instance_id"])
+                router.route_arrived_requests(current, skip_prefill_ids=stalled_prefill)
+                # Release prefill -> decode handoffs whose delay expired.
+                still_held = []
+                for release_ns, req in held_transfers:
+                    if release_ns <= current:
+                        router.transfer_prefill_request([req])
+                    else:
+                        still_held.append((release_ns, req))
+                held_transfers = still_held
+            else:
+                router.route_arrived_requests(current)
 
         instance_id = npu2inst_mapping[sys]  # get instance id from NPU id
         node_id = inst2node_mapping[instance_id] # get node id from instance id
@@ -691,6 +731,9 @@ def main():
 
         # check request is done
         prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
+        if args.telemetry_output is not None:
+            com = out_dict.get('com_cycle', 0) if out_dict is not None else 0
+            batch_telemetry.append((args.run_id, instance_id, id, current, current, 0, 0, 0, com))
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -706,7 +749,31 @@ def main():
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
+            if fault_manager is not None:
+                now_s = current / 1e9
+                handoff_delay = 0
+                for fault in fault_manager["faults"]:
+                    if fault["mode"] != "kv_handoff_delay":
+                        continue
+                    if not fault_matches(fault, "prefill", instance_id):
+                        continue
+                    weight = severity_weight(fault["schedule"], now_s)
+                    handoff_delay = max(handoff_delay, int(round(weight * fault["delay_ns"])))
+                stalled_decode = set()
+                for inst in instances:
+                    if inst.get("pd_type") == "decode":
+                        if is_stalled(fault_manager["faults"], "decode", inst["instance_id"], now_s):
+                            stalled_decode.add(inst["instance_id"])
+                if handoff_delay > 0:
+                    for req in finished_reqs:
+                        held_transfers.append((current + handoff_delay, req))
+                    fault_audit.append({"type": "handoff_hold", "instance": instance_id,
+                                        "time_ns": current, "delay_ns": handoff_delay,
+                                        "count": len(finished_reqs)})
+                else:
+                    router.transfer_prefill_request(finished_reqs, skip_decode_ids=stalled_decode)
+            else:
+                router.transfer_prefill_request(finished_reqs)
 
         # An NPU that opened a DP round owes ASTRA-Sim that round's graph, and it
         # has to be handed over before the scheduler may open anything new. vLLM
@@ -721,7 +788,16 @@ def main():
         # that overwrote the entry: the first graph never ran, and the other
         # pipeline stage blocked forever on a RECV that never came.
         pending = dp_ready_workloads.get(sys)
-        new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
+        if fault_manager is not None:
+            role = instances[instance_id].get("pd_type") or "colocated"
+            if role not in ("prefill", "decode"):
+                role = "prefill" if instances[instance_id]["instance_id"] in prefill_instance else "decode"
+            if is_stalled(fault_manager["faults"], role, instance_id, current / 1e9):
+                new_req = None
+            else:
+                new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
+        else:
+            new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
         # Hand over a workload pre-generated by a DP round this NPU opened.
@@ -945,6 +1021,15 @@ def main():
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    inputs_root=run_paths.inputs_root)
+                    if fault_manager is not None:
+                        role = instance.get("pd_type") or "prefill"
+                        entries = apply_to_trace_rows(
+                            fault_manager["faults"], trace_data.rows,
+                            role, instance_id, current / 1e9)
+                        for entry in entries:
+                            entry.update({"batch_id": new_req.batch_id, "instance": instance_id,
+                                          "time_ns": current})
+                            fault_audit.append(entry)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1104,7 +1189,8 @@ def main():
                 )
         # check if all requests are done for current instance#
         # NOTE: 'instance_id' could occur in duplicate, because 'npu2inst_mapping[sys]' is not one-to-one mapping
-        if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions():
+        has_held = fault_manager is not None and len(held_transfers) > 0
+        if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions() and not has_held:
             # For DP groups: only mark done when ALL members of the group are empty
             dg = inst_dp_group.get(instance_id)
             if dg is not None:
@@ -1153,6 +1239,13 @@ def main():
                 next_arrival = router.get_next_pending_arrival()
                 if next_arrival is not None and next_arrival > current:
                     current = next_arrival
+            if fault_manager is not None and held_transfers:
+                # Wake an idle cluster at the next handoff release time.
+                # Without this an all-idle run sleeps past the release and hangs.
+                next_release = min(release for release, _ in held_transfers)
+                if next_release > current:
+                    current = next_release
+                pass_msg = "pass %d" % int(current)
             controller.write_flush(p, pass_msg)
         
         # flush
@@ -1256,6 +1349,22 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+
+    if fault_manager is not None:
+        audit_path = os.path.join(run_paths.inputs_root, "injection_audit.jsonl")
+        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+        with open(audit_path, "w") as f:
+            for entry in fault_audit:
+                f.write(json.dumps(entry) + "\n")
+        print(f"Fault audit written to: {audit_path} ({len(fault_audit)} records)")
+    if args.telemetry_output is not None:
+        os.makedirs(args.telemetry_output, exist_ok=True)
+        batch_path = os.path.join(args.telemetry_output, "batch_telemetry.csv")
+        with open(batch_path, "w") as f:
+            f.write("run_id,instance_id,batch_id,batch_time_ns,finish_ns,duration_ns,num_prefill,num_decode,total_len\n")
+            for row in batch_telemetry:
+                f.write(",".join(str(v) for v in row) + "\n")
+        print(f"Telemetry written to: {args.telemetry_output}")
 
     # --save-trace-text writes the text into the run directory, so keeping it
     # is implied: producing the text and then deleting it would be pointless.

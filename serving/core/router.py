@@ -186,13 +186,16 @@ class Router:
 
         return len(sub_reqs)
 
-    def route_arrived_requests(self, current_time_ns):
+    def route_arrived_requests(self, current_time_ns, skip_prefill_ids=None):
         """Route requests that have arrived by current_time_ns to instances.
 
         Called at the start of each iteration in the main simulation loop.
         Returns the number of newly routed requests.
+        skip_prefill_ids lets a stalled prefill instance sit out; arrivals
+        stay pending instead of being dropped.
         """
         routed = 0
+        skip_prefill_ids = skip_prefill_ids or set()
         while self._pending_idx < len(self._pending_requests):
             req_data = self._pending_requests[self._pending_idx]
             if req_data['arrival_time_ns'] > current_time_ns:
@@ -200,6 +203,8 @@ class Router:
 
             instance_id = self._select_instance(self.prefill_schedulers, "prefill")
             sched = self.prefill_schedulers[instance_id]
+            if sched.instance_id in skip_prefill_ids:
+                break
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -321,7 +326,11 @@ class Router:
                 scheduler.pd_type
             )
 
-    def transfer_prefill_request(self, requests):
+    def transfer_prefill_request(self, requests, skip_decode_ids=None):
+        skip_decode_ids = skip_decode_ids or set()
         for req in requests:
             instance_id = self._select_instance(self.decode_schedulers, "decode")
-            self.decode_schedulers[instance_id].add_decode(req)
+            sched = self.decode_schedulers[instance_id]
+            if sched.instance_id in skip_decode_ids:
+                continue
+            sched.add_decode(req)
