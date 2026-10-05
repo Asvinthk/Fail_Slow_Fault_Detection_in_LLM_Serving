@@ -155,6 +155,20 @@ def test_network_target_matches_instance_regardless_of_role():
         {"target": {"role": "network", "instance_id": 1}}, "decode", 0) is False
 
 
+def test_neutral_batches_are_not_labeled_applied():
+    # tp=1 dense trace: no collective rows, so a network fault visits
+    # batches but changes nothing -> applied must be False, never silent.
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    faults = [{"fault_id": "n1", "target": {"role": "network", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "network_degradation",
+               "factor": 1.5, "schedule": schedule}]
+    rows = [make_row(comp=1000, comm=0)]
+    audits = apply_to_trace_rows(faults, rows, "decode", 0, 5.0)
+    assert len(audits) == 1
+    assert audits[0]["applied"] is False
+    assert "note" in audits[0]
+
+
 def test_intermittent_and_ramp():
     inter = {"start_s": 0.0, "end_s": 10.0, "profile": "intermittent",
              "period_s": 2.0, "duty": 0.5}
@@ -185,6 +199,53 @@ class _StubRouter:
 
     def get_next_pending_arrival(self):
         return self._nxt
+
+
+class _FakeSched:
+    def __init__(self, instance_id, pd_type):
+        self.instance_id = instance_id
+        self.pd_type = pd_type
+        self.waiting = []
+        self.running = []
+        self.admitted = []
+
+    def add_decode(self, req):
+        self.admitted.append(req)
+
+
+def _make_router(n_decode=1):
+    from serving.core.router import Router
+    decodes = [_FakeSched(i + 100, "decode") for i in range(n_decode)]
+    prefill = [_FakeSched(0, "prefill")]
+    router = Router(num_instances=n_decode + 1,
+                    schedulers=prefill + decodes, req_num=0,
+                    routing_policy="RR", seed=1)
+    return router, decodes
+
+
+def test_stalled_decode_holds_instead_of_dropping():
+    router, decodes = _make_router(n_decode=1)
+    req = object()
+    router.transfer_prefill_request([req], skip_decode_ids={100})
+    assert decodes[0].admitted == []
+    assert router.has_held_decode() is True
+    # Still stalled: stays held.
+    assert router.retry_held_decode(skip_decode_ids={100}) == []
+    assert router.has_held_decode() is True
+    # Recovered: admitted exactly once.
+    admitted = router.retry_held_decode(skip_decode_ids=set())
+    assert admitted == [req]
+    assert decodes[0].admitted == [req]
+    assert router.has_held_decode() is False
+
+
+def test_transfer_prefers_available_decode():
+    router, decodes = _make_router(n_decode=2)
+    req = object()
+    router.transfer_prefill_request([req], skip_decode_ids={100})
+    assert router.has_held_decode() is False
+    assert decodes[1].admitted == [req]
+    assert decodes[0].admitted == []
 
 
 def test_pass_response_unchanged_without_faults():

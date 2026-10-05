@@ -30,6 +30,11 @@ class Router:
         self._pending_idx = 0
         self._enable_prefix_caching = False
         self._is_init = True
+        # Prefill-finished requests waiting for a decode instance. Used
+        # when every decode instance is stalled: the requests stay here
+        # instead of being silently dropped, and are retried once a
+        # decode instance is available again.
+        self._held_decode = []
 
         # Agentic session dependency tracking
         self._deferred_sessions = {}     # session_id -> session state dict
@@ -329,8 +334,36 @@ class Router:
     def transfer_prefill_request(self, requests, skip_decode_ids=None):
         skip_decode_ids = skip_decode_ids or set()
         for req in requests:
-            instance_id = self._select_instance(self.decode_schedulers, "decode")
-            sched = self.decode_schedulers[instance_id]
-            if sched.instance_id in skip_decode_ids:
+            available = [s for s in self.decode_schedulers
+                         if s.instance_id not in skip_decode_ids]
+            if not available:
+                # No decode instance can take this request right now.
+                # Hold it for retry after recovery; never silently drop it.
+                self._held_decode.append(req)
                 continue
-            sched.add_decode(req)
+            instance_id = self._select_instance(available, "decode")
+            available[instance_id].add_decode(req)
+
+    def has_held_decode(self):
+        """Check if prefill-finished requests are waiting for decode."""
+        return bool(self._held_decode)
+
+    def retry_held_decode(self, skip_decode_ids=None):
+        """Move held requests to decode instances that are available now.
+
+        Returns the list of requests admitted on this call.
+        """
+        skip_decode_ids = skip_decode_ids or set()
+        still_held = []
+        admitted = []
+        for req in self._held_decode:
+            available = [s for s in self.decode_schedulers
+                         if s.instance_id not in skip_decode_ids]
+            if not available:
+                still_held.append(req)
+                continue
+            instance_id = self._select_instance(available, "decode")
+            available[instance_id].add_decode(req)
+            admitted.append(req)
+        self._held_decode = still_held
+        return admitted

@@ -774,6 +774,19 @@ def main():
                     else:
                         still_held.append((release_ns, req))
                 held_transfers = still_held
+                # Retry requests held while every decode instance was
+                # stalled. Without this they would wait forever when no
+                # new prefill batch finishes after recovery.
+                stalled_now = set()
+                for inst in instances:
+                    if inst.get("pd_type") == "decode":
+                        if is_stalled(fault_manager["faults"], "decode", inst["instance_id"], current / 1e9):
+                            stalled_now.add(inst["instance_id"])
+                admitted = router.retry_held_decode(skip_decode_ids=stalled_now)
+                if args.telemetry_output is not None:
+                    for req in admitted:
+                        if req.decode_admit_ns == -1:
+                            req.decode_admit_ns = current
             else:
                 router.route_arrived_requests(current)
 
@@ -1324,7 +1337,7 @@ def main():
         # check if all requests are done for current instance#
         # NOTE: 'instance_id' could occur in duplicate, because 'npu2inst_mapping[sys]' is not one-to-one mapping
         has_held = fault_manager is not None and len(held_transfers) > 0
-        if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions() and not has_held:
+        if (instance_id not in decode_instance or is_prefill_done) and instance_id not in done_instance and schedulers[instance_id].is_request_empty() and not router.has_pending_requests() and not router.has_deferred_sessions() and not has_held and not router.has_held_decode():
             # For DP groups: only mark done when ALL members of the group are empty
             dg = inst_dp_group.get(instance_id)
             if dg is not None:
