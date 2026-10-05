@@ -457,8 +457,11 @@ def main():
         if not os.path.isabs(fault_config_path):
             fault_config_path = os.path.join("..", fault_config_path)
         fault_manager = load_fault_config(fault_config_path)
-        if args.telemetry_output is not None and not os.path.isabs(args.telemetry_output):
-            args.telemetry_output = os.path.join("..", args.telemetry_output)
+    # The sim chdir'd into astra-sim/ above, so repo-relative telemetry
+    # output needs the same ".." prefix. This applies with or without
+    # faults: healthy runs write telemetry too.
+    if args.telemetry_output is not None and not os.path.isabs(args.telemetry_output):
+        args.telemetry_output = os.path.join("..", args.telemetry_output)
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
