@@ -154,11 +154,13 @@ def fault_matches(fault, role, instance_id):
     target = fault["target"]
     target_role = target["role"]
     target_inst = target["instance_id"]
+    if target_role == "network":
+        # Network faults target an instance regardless of its role.
+        if target_inst == "all":
+            return True
+        return target_inst == instance_id
     role_match = (target_role == role) or (target_role == "transfer" and role == "prefill")
     if not role_match:
-        # network role with instance "all" hits every instance
-        if target_role == "network" and target_inst == "all":
-            return True
         return False
     if target_inst == "all":
         return True
@@ -186,7 +188,26 @@ def apply_to_trace_rows(faults, rows, role, instance_id, now_s):
     Called after generate_trace built the rows and before graph conversion,
     so the graph-cache digest changes naturally. Integer rounding is applied
     because the Chakra converter requires int comp_time.
+
+    Semantics per mode:
+      compute_multiplicative: every compute row scaled by the effective
+        factor 1 + w(t)*(factor-1).
+      compute_additive: per-ITERATION delay. delta_ns (weighted by w(t))
+        is added to the comp_time of ONE designated serial row (the last
+        11-field compute row of the chain), not to every layer. Adding it
+        per layer would multiply the delay by the layer count.
+      kv_transfer_bandwidth: P/D comm_size on qkv_proj rows inflated by
+        the effective factor 1 + w(t)*(1/fraction - 1). Models only the
+        bandwidth term, not latency.
+      network_degradation (mechanism): time-varying scaling of comm_size
+        on every row carrying a collective (comm_type != NONE with
+        comm_size != 0), for the targeted instance. Time-varying link
+        LATENCY is not modeled here (needs ASTRA-Sim changes).
+
+    Rows that are not 11-field layer rows (MoE EXPERT/PIM markers) are
+    left untouched.
     """
+    COL_COMM_TYPE = 8
     audits = []
     for fault in faults:
         if fault["mode"] == "worker_stall":
@@ -203,42 +224,62 @@ def apply_to_trace_rows(faults, rows, role, instance_id, now_s):
         applied_comp = 0
         nominal_comm = 0
         applied_comm = 0
+        # First pass: copy tuples to lists so scaling never crashes.
         for idx, old_row in enumerate(rows):
             if len(old_row) != 11:
                 continue
-            # Trace rows are tuples; copy to a list before scaling.
-            row = list(old_row)
-            rows[idx] = row
-            layer = row[COL_LAYER]
-            if mode in ("compute_multiplicative", "compute_additive", "network_degradation"):
-                old = int(row[COL_COMP_TIME])
-                nominal_comp += old
+            rows[idx] = list(old_row)
+        if mode == "compute_additive":
+            nominal_comp = sum(int(r[COL_COMP_TIME]) for r in rows
+                               if len(r) == 11)
+            for idx in range(len(rows) - 1, -1, -1):
+                if len(rows[idx]) != 11:
+                    continue
+                old = int(rows[idx][COL_COMP_TIME])
+                new = int(old + round(weight * fault["delta_ns"]))
+                rows[idx][COL_COMP_TIME] = str(new)
+                break
+            applied_comp = (nominal_comp
+                            + int(round(weight * fault["delta_ns"])))
+        else:
+            for idx, row in enumerate(rows):
+                if len(row) != 11:
+                    continue
+                layer = row[COL_LAYER]
                 if mode == "compute_multiplicative":
+                    old = int(row[COL_COMP_TIME])
+                    nominal_comp += old
                     factor = 1.0 + weight * (fault["factor"] - 1.0)
                     new = int(round(old * factor))
-                elif mode == "compute_additive":
-                    new = int(old + round(weight * fault["delta_ns"]))
-                else:
-                    # network_degradation as output-level compute scaling placeholder
-                    scale = 1.0 + weight * (fault.get("factor", 1.5) - 1.0)
-                    new = int(round(old * scale))
-                row[COL_COMP_TIME] = str(new)
-                applied_comp += new
-            if mode in ("kv_transfer_bandwidth", "network_degradation"):
-                # Only qkv_proj rows carry the P/D KV transfer in comm_size.
-                if layer.startswith("qkv_proj") and role == "prefill":
-                    old_comm = int(row[COL_COMM_SIZE])
-                    nominal_comm += old_comm
-                    if mode == "kv_transfer_bandwidth":
+                    row[COL_COMP_TIME] = str(new)
+                    applied_comp += new
+                elif mode == "network_degradation":
+                    if fault.get("injection_layer") == "output_approx":
+                        continue
+                    old = int(row[COL_COMP_TIME])
+                    nominal_comp += old
+                    applied_comp += old
+                    comm_type = str(row[COL_COMM_TYPE])
+                    try:
+                        old_comm = int(row[COL_COMM_SIZE])
+                    except (ValueError, TypeError):
+                        old_comm = 0
+                    if comm_type != "NONE" and old_comm != 0:
+                        nominal_comm += old_comm
+                        scale = 1.0 + weight * (fault.get("factor", 1.5) - 1.0)
+                        new_comm = int(round(old_comm * scale))
+                        row[COL_COMM_SIZE] = str(new_comm)
+                        applied_comm += new_comm
+                if mode in ("kv_transfer_bandwidth",):
+                    # Only qkv_proj rows carry the P/D KV transfer in comm_size.
+                    if layer.startswith("qkv_proj") and role == "prefill":
+                        old_comm = int(row[COL_COMM_SIZE])
+                        nominal_comm += old_comm
                         frac = fault["bandwidth_fraction"]
-                        new_comm = int(round(old_comm / frac))
-                    else:
-                        new_comm = int(round(old_comm * 1.0))
-                    row[COL_COMM_SIZE] = str(new_comm)
-                    applied_comm += new_comm
-        # Additive per-iteration delay: documented as one extra serial delay.
-        # The caller adds it to the last serial row if needed; here we keep
-        # the per-layer math only, so students can see exactly what changed.
+                        eff = 1.0 + weight * (1.0 / frac - 1.0)
+                        new_comm = int(round(old_comm * eff))
+                        row[COL_COMM_SIZE] = str(new_comm)
+                        applied_comm += new_comm
         audits.append({
             "fault_id": fault["fault_id"],
             "mode": mode,

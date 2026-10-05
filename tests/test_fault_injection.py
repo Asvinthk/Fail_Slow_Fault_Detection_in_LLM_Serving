@@ -80,6 +80,33 @@ def test_additive_delta():
     assert rows[0][1] == "1500"
 
 
+def test_additive_applies_once_per_iteration_not_per_layer():
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    faults = [{"fault_id": "f1", "target": {"role": "decode", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "compute_additive",
+               "delta_ns": 500, "schedule": schedule}]
+    rows = [make_row(layer="attention_0", comp=1000),
+            make_row(layer="mlp_0", comp=2000),
+            make_row(layer="sampler_0", comp=3000)]
+    audits = apply_to_trace_rows(faults, rows, "decode", 0, 5.0)
+    assert rows[0][1] == "1000"
+    assert rows[1][1] == "2000"
+    assert rows[2][1] == "3500"
+    assert audits[0]["applied_comp_sum"] - audits[0]["nominal_comp_sum"] == 500
+
+
+def test_moe_and_pim_marker_rows_untouched():
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    faults = [{"fault_id": "f1", "target": {"role": "decode", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "compute_multiplicative",
+               "factor": 2.0, "schedule": schedule}]
+    marker = ["EXPERT 0", "ALLTOALL:0,1"]
+    rows = [make_row(comp=1000), marker]
+    apply_to_trace_rows(faults, rows, "decode", 0, 5.0)
+    assert rows[0][1] == "2000"
+    assert rows[1] == marker
+
+
 def test_kv_bandwidth_inflates_comm_size():
     schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
     faults = [{"fault_id": "f1", "target": {"role": "transfer", "instance_id": 0},
@@ -88,6 +115,44 @@ def test_kv_bandwidth_inflates_comm_size():
     rows = [make_row(layer="qkv_proj_0", comp=1000, comm=800)]
     apply_to_trace_rows(faults, rows, "prefill", 0, 5.0)
     assert rows[0][9] == "1600"
+
+
+def test_kv_bandwidth_respects_partial_weight():
+    schedule = {"start_s": 0.0, "end_s": 4.0, "profile": "ramp_up", "ramp_s": 4.0}
+    faults = [{"fault_id": "f1", "target": {"role": "transfer", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "kv_transfer_bandwidth",
+               "bandwidth_fraction": 0.5, "schedule": schedule}]
+    rows = [make_row(layer="qkv_proj_0", comp=1000, comm=800)]
+    apply_to_trace_rows(faults, rows, "prefill", 0, 2.0)
+    # w(2s) = 0.5 -> effective inflation 1 + 0.5*(2-1) = 1.5x
+    assert rows[0][9] == "1200"
+
+
+def test_network_degradation_scales_collective_comm_only():
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    faults = [{"fault_id": "n1", "target": {"role": "network", "instance_id": 0},
+               "injection_layer": "mechanism", "mode": "network_degradation",
+               "factor": 2.0, "schedule": schedule}]
+
+    def comm_row(layer, comp, comm):
+        row = make_row(layer=layer, comp=comp, comm=comm)
+        row[8] = "ALLREDUCE"
+        return row
+
+    rows = [comm_row("o_proj_0", 1000, 800), make_row(comp=1000, comm=0)]
+    audits = apply_to_trace_rows(faults, rows, "decode", 0, 5.0)
+    assert rows[0][1] == "1000"  # comp untouched by network faults
+    assert rows[0][9] == "1600"
+    assert rows[1][9] == "0"
+    assert audits[0]["applied_comm_sum"] == 1600
+
+
+def test_network_target_matches_instance_regardless_of_role():
+    schedule = {"start_s": 0.0, "end_s": 10.0, "profile": "step"}
+    assert fault_matches(
+        {"target": {"role": "network", "instance_id": 1}}, "prefill", 1) is True
+    assert fault_matches(
+        {"target": {"role": "network", "instance_id": 1}}, "decode", 0) is False
 
 
 def test_intermittent_and_ramp():
