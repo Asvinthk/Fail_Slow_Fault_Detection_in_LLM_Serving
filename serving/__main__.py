@@ -115,6 +115,30 @@ def _runtime_limit(value):
     return float('inf') if value == 0 else value
 
 
+def _note_batch_built(batch_meta, schedulers, instance_id, batch, current):
+    """Snapshot batch shape at schedule time for telemetry.
+
+    add_done only sees the ASTRA-Sim report (sys, id), so the shape
+    observed here is remembered per (instance_id, batch_id) and picked
+    up at completion via the report's id - 1 mapping (the same mapping
+    add_done itself uses). Guarded by the caller: with telemetry off,
+    batch_meta stays empty and this is never called.
+    """
+    for req in batch.requests:
+        if req.first_scheduled_ns == -1:
+            req.first_scheduled_ns = current
+    batch_meta[(instance_id, batch.batch_id)] = {
+        "batch_time_ns": current,
+        "num_prefill": batch.num_prefill,
+        "num_decode": batch.num_decode,
+        "total_len": batch.total_len,
+        "kv_len": batch.kv_len,
+        "pd_kv_send_tokens": batch.pd_kv_send_tokens,
+        "n_waiting": len(schedulers[instance_id].waiting),
+        "n_running": len(schedulers[instance_id].running),
+    }
+
+
 def _cluster_config_path(path):
     if os.path.isabs(path):
         return path
@@ -414,9 +438,14 @@ def main():
     held_transfers = []
     batch_telemetry = []
     # Batch shape snapshot at schedule time, keyed (instance_id, batch_id).
-    # add_done only sees (id, sys, finish), so the shape observed at
-    # scheduling is remembered here to fill the telemetry row at completion.
+    # Read back at completion via the report's id - 1 (the same mapping
+    # add_done uses to find the batch). Reports repeat across polls until
+    # the NPU gets new work, so (instance, sys, id) repeats are ignored.
     batch_meta = {}
+    telemetry_seen = set()
+    # Stall windows skip schedule() polls; counted per (fault, instance)
+    # so the audit can show the stall took effect (absence of batches).
+    stall_skips = {}
     if args.fault_config is not None:
         from serving.core.fault_injection import (
             load_fault_config, severity_weight, fault_matches,
@@ -766,20 +795,23 @@ def main():
 
         # check request is done
         prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
-        if args.telemetry_output is not None:
-            com = out_dict.get('com_cycle', 0) if out_dict is not None else 0
-            meta = batch_meta.get((instance_id, id))
-            if meta is None:
-                batch_telemetry.append((args.run_id, instance_id, id, sys, current, current,
-                                        0, 0, 0, 0, 0, 0, 0, 0, com))
-            else:
-                duration = current - meta["batch_time_ns"]
-                batch_telemetry.append((args.run_id, instance_id, id, sys,
-                                        meta["batch_time_ns"], current, duration,
-                                        meta["num_prefill"], meta["num_decode"],
-                                        meta["total_len"], meta["kv_len"],
-                                        meta["pd_kv_send_tokens"],
-                                        meta["n_waiting"], meta["n_running"], com))
+        if args.telemetry_output is not None and out_dict is not None:
+            if (instance_id, sys, id) not in telemetry_seen:
+                telemetry_seen.add((instance_id, sys, id))
+                com = out_dict.get('com_cycle', 0)
+                # Report id is the batch's id + 1 (see add_done's id -= 1).
+                meta = batch_meta.get((instance_id, id - 1))
+                if meta is None:
+                    batch_telemetry.append((args.run_id, instance_id, id, sys, current, current,
+                                            0, 0, 0, 0, 0, 0, 0, 0, com))
+                else:
+                    duration = current - meta["batch_time_ns"]
+                    batch_telemetry.append((args.run_id, instance_id, id, sys,
+                                            meta["batch_time_ns"], current, duration,
+                                            meta["num_prefill"], meta["num_decode"],
+                                            meta["total_len"], meta["kv_len"],
+                                            meta["pd_kv_send_tokens"],
+                                            meta["n_waiting"], meta["n_running"], com))
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -812,13 +844,17 @@ def main():
             if fault_manager is not None:
                 now_s = current / 1e9
                 handoff_delay = 0
+                handoff_fault = None
                 for fault in fault_manager["faults"]:
                     if fault["mode"] != "kv_handoff_delay":
                         continue
                     if not fault_matches(fault, "prefill", instance_id):
                         continue
                     weight = severity_weight(fault["schedule"], now_s)
-                    handoff_delay = max(handoff_delay, int(round(weight * fault["delay_ns"])))
+                    candidate = int(round(weight * fault["delay_ns"]))
+                    if candidate > handoff_delay:
+                        handoff_delay = candidate
+                        handoff_fault = fault
                 stalled_decode = set()
                 for inst in instances:
                     if inst.get("pd_type") == "decode":
@@ -827,9 +863,16 @@ def main():
                 if handoff_delay > 0:
                     for req in finished_reqs:
                         held_transfers.append((current + handoff_delay, req))
-                    fault_audit.append({"type": "handoff_hold", "instance": instance_id,
+                    fault_audit.append({"type": "handoff_hold",
+                                        "fault_id": handoff_fault["fault_id"],
+                                        "mode": "kv_handoff_delay",
+                                        "weight": severity_weight(handoff_fault["schedule"], now_s),
+                                        "instance": instance_id,
                                         "time_ns": current, "delay_ns": handoff_delay,
-                                        "count": len(finished_reqs)})
+                                        "count": len(finished_reqs),
+                                        "nominal_comp_sum": 0, "applied_comp_sum": 0,
+                                        "nominal_comm_sum": 0, "applied_comm_sum": 0,
+                                        "applied": True})
                 else:
                     if args.telemetry_output is not None:
                         for req in finished_reqs:
@@ -862,6 +905,17 @@ def main():
                 role = "prefill" if instances[instance_id]["instance_id"] in prefill_instance else "decode"
             if is_stalled(fault_manager["faults"], role, instance_id, current / 1e9):
                 new_req = None
+                # The stall took effect here: no batch scheduled. Count it
+                # so the audit shows the window (absence of batches is the
+                # evidence for fail-stop).
+                for fault in fault_manager["faults"]:
+                    if fault["mode"] != "worker_stall":
+                        continue
+                    if not fault_matches(fault, role, instance_id):
+                        continue
+                    if severity_weight(fault["schedule"], current / 1e9) > 0:
+                        key = (fault["fault_id"], instance_id)
+                        stall_skips[key] = stall_skips.get(key, 0) + 1
             else:
                 new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
         else:
@@ -912,6 +966,9 @@ def main():
                 # NPU an instance owns.
                 schedulers[instance_id].inflight.append(dummy)
                 dp_pending[dg][instance_id].append((dummy, inst2node_mapping[instance_id]))
+                if args.telemetry_output is not None:
+                    _note_batch_built(batch_meta, schedulers, instance_id,
+                                      dummy, current)
 
                 if all(dp_pending[dg][i] for i in dp_groups[dg]):
                     # Every DP member has a batch queued — take one from each,
@@ -962,9 +1019,12 @@ def main():
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
                                        workload_name=dp_workload_name,
-                                       inputs_root=run_paths.inputs_root,
-                                       save_trace_text=args.save_trace_text,
-                                       trace=trace_data)
+                                        inputs_root=run_paths.inputs_root,
+                                        save_trace_text=args.save_trace_text,
+                                        trace=trace_data)
+                        if args.telemetry_output is not None:
+                            _note_batch_built(batch_meta, schedulers, inst_id,
+                                              batch, current)
                         # ``fired[0]`` is the NPU that opened this member's
                         # round -- the one that owes ASTRA-Sim its graph. That is
                         # normally this very poll, and then it is answered
@@ -1050,9 +1110,12 @@ def main():
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
                                            workload_name=dp_workload_name,
-                                           inputs_root=run_paths.inputs_root,
-                                           save_trace_text=args.save_trace_text,
-                                           trace=trace_data)
+                                            inputs_root=run_paths.inputs_root,
+                                            save_trace_text=args.save_trace_text,
+                                            trace=trace_data)
+                            if args.telemetry_output is not None:
+                                _note_batch_built(batch_meta, schedulers, inst_id,
+                                                  batch, current)
                             # See the twin block above: the NPU that opened a
                             # member's round owes its graph, and that is normally
                             # this poll.
@@ -1099,19 +1162,8 @@ def main():
                                           "time_ns": current})
                             fault_audit.append(entry)
                     if args.telemetry_output is not None:
-                        for req in new_req.requests:
-                            if req.first_scheduled_ns == -1:
-                                req.first_scheduled_ns = current
-                        batch_meta[(instance_id, new_req.batch_id)] = {
-                            "batch_time_ns": current,
-                            "num_prefill": new_req.num_prefill,
-                            "num_decode": new_req.num_decode,
-                            "total_len": new_req.total_len,
-                            "kv_len": new_req.kv_len,
-                            "pd_kv_send_tokens": new_req.pd_kv_send_tokens,
-                            "n_waiting": len(schedulers[instance_id].waiting),
-                            "n_running": len(schedulers[instance_id].running),
-                        }
+                        _note_batch_built(batch_meta, schedulers, instance_id,
+                                          new_req, current)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1449,6 +1501,23 @@ def main():
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
 
     if fault_manager is not None:
+        # Stall windows never touch trace rows, so they leave no per-batch
+        # record. Summarize them here instead: skipped schedule polls are
+        # the evidence the stall took effect (absence of batches).
+        for (stall_fault_id, stall_inst), skipped in stall_skips.items():
+            stall_fault = next(
+                f for f in fault_manager["faults"]
+                if f["fault_id"] == stall_fault_id)
+            fault_audit.append({
+                "type": "worker_stall_window", "fault_id": stall_fault_id,
+                "mode": "worker_stall", "weight": 1.0,
+                "instance": stall_inst,
+                "time_ns": int(stall_fault["schedule"]["start_s"] * 1e9),
+                "skipped_schedules": skipped,
+                "nominal_comp_sum": 0, "applied_comp_sum": 0,
+                "nominal_comm_sum": 0, "applied_comm_sum": 0,
+                "applied": skipped > 0,
+            })
         # inputs_root is deleted after a successful run unless
         # --keep-inputs, so the audit must live somewhere persistent:
         # next to --telemetry-output if given, else next to --output.

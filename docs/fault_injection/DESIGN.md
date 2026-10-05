@@ -12,10 +12,14 @@
    `1 + w(t)*(factor-1)`. Additive is per ITERATION: the weighted
    delta is added to ONE serial row (the last 11-field row), never
    per layer. MoE EXPERT / PIM marker rows (not 11-field) are left
-   untouched. Measured (single_node_pd_instance, example_trace, 10 reqs):
-   healthy 1661784496 ns; decode-1 factor 2.0 -> 2318732875 ns
-   (+39.5%), audit 59 records all on instance 1 with comp sums
-   doubled (11092427 -> 22184854), reproducible on rerun.
+   untouched. Measured in-container (single_node_pd_instance,
+   example_trace, 10 reqs): healthy 1661784496 ns (x2 identical);
+   decode-1 factor 2.0 -> 2318421829 ns (+39.5%, x2 identical),
+   audit 59 records all on instance 1 with per-batch comp sums
+   exactly doubled (total 656787414 -> 1313574828). A pre-fix record
+   of 2318732875 ns for the same fault differs by 0.013%: the
+   fault-boundary wake-ups added since shift idle polling slightly;
+   the per-batch injection is unchanged (ratio exactly 2.0).
 
 2. `kv_transfer_bandwidth`
    Hook: same function, `comm_size` on `qkv_proj` rows inflated by
