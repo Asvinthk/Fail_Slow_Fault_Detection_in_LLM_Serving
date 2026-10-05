@@ -40,6 +40,7 @@ converted to ns internally (`current / 1e9`).
 - Unknown keys or bad combos are rejected at startup with `ValueError`.
 - `worker_stall` with `dp_group` configs is rejected (clear error).
 
-Audit: `<inputs_root>/injection_audit.jsonl`, one line per affected
-batch plus handoff holds. `successfully_applied` (manifest) is true
-only if the audit has a record after the fault start.
+Audit: `injection_audit.jsonl` next to `--telemetry-output` when given,
+else next to `--output` (never under the auto-deleted inputs root).
+One line per affected batch plus handoff holds. `successfully_applied`
+(manifest) is true only if the audit has a record after the fault start.

@@ -66,7 +66,11 @@ def label_window(window_end_s, entry):
 
 
 def collect_dataset(data_root, window_s, repo_root):
-    manifest = load_manifest(os.path.join(data_root, "manifest.jsonl"))
+    manifest_path = os.path.join(data_root, "manifest.jsonl")
+    if not os.path.exists(manifest_path):
+        print("no manifest.jsonl under %s; run generate first" % data_root)
+        return None
+    manifest = load_manifest(manifest_path)
     windows_by_run = []
     labels, run_ids, pair_ids, workload_ids, clusters = [], [], [], [], []
     for entry in manifest:
@@ -126,8 +130,10 @@ def main():
     report_root = args.report if os.path.isabs(args.report) else os.path.join(repo_root, args.report)
     os.makedirs(report_root, exist_ok=True)
 
-    X, labels, run_ids, pair_ids, workload_ids, clusters, windows = collect_dataset(
-        data_root, args.window_s, repo_root)
+    collected = collect_dataset(data_root, args.window_s, repo_root)
+    if collected is None:
+        return 2
+    X, labels, run_ids, pair_ids, workload_ids, clusters, windows = collected
     if len(X) == 0:
         print("no windows found under %s; run generate first" % data_root)
         return 2

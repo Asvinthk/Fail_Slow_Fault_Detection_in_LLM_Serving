@@ -53,6 +53,7 @@ TIMEOUT="${TIMEOUT:-1800}"
 COMMON=(--dtype bfloat16 --block-size 16 --log-level WARNING)
 
 C=configs/cluster
+FF=experiments/fault_detection/example_faults
 TRACE=workloads/example_trace.jsonl
 MIXED=workloads/workload_me2_01_mixed.jsonl
 SG_L=workloads/sharegpt-llama-3.1-8b-300-sps10.jsonl
@@ -143,6 +144,15 @@ SCENARIOS=(
     "pd_sharegpt|--cluster-config $C/single_node_pd_instance.json --dataset $SG_L --num-reqs 20"
     "moe_pd|--cluster-config $C/single_node_moe_pd_instance.json --dataset $TRACE --num-reqs 10"
     "heterogeneous|--cluster-config $C/single_node_heterogeneous.json --dataset $SG_Q32 --num-reqs 10"
+
+    # --- fault injection (fail-slow prototype; simulator injection modes only).
+    # Each must differ from the plain "pd" clock above (flag parsing alone is
+    # not coverage). Baselines are recorded with the fault active via
+    # ./serving/validate.sh --update <name> in the sim container.
+    "pd_fault_decode_mult|--cluster-config $C/single_node_pd_instance.json --dataset $TRACE --num-reqs 10 --fault-config $FF/decode_slow_2x.json"
+    "pd_fault_transfer_bw|--cluster-config $C/single_node_pd_instance.json --dataset $TRACE --num-reqs 10 --fault-config $FF/transfer_half_bw.json"
+    "pd_fault_handoff|--cluster-config $C/single_node_pd_instance.json --dataset $TRACE --num-reqs 10 --fault-config $FF/handoff_100ms.json"
+    "pd_fault_stall|--cluster-config $C/single_node_pd_instance.json --dataset $TRACE --num-reqs 10 --fault-config $FF/decode_stall.json"
 
     # --- PIM offloading ---
     "pim|--cluster-config $C/single_node_pim_instance.json --enable-attn-offloading --dataset $TRACE --num-reqs 10"
