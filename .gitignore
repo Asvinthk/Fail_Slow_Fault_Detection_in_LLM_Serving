@@ -23,11 +23,3 @@ astra-sim/inputs/runs/
 # Fault-detection experiment outputs (paired runs, telemetry, manifests).
 experiments/out/
 experiments/report/
-
-# AI agent cache files
-.claude/
-.codex/
-.cursor/
-.copilot/
-.aider*
-.continue/

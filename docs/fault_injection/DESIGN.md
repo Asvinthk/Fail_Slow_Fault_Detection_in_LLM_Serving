@@ -80,6 +80,11 @@
 Fault time is evaluated at the `current` clock passed into
 scheduling for that batch. Batches already submitted are never
 altered. Onset error is at most one iteration duration.
+Fault-active runs carry a small observer effect on untargeted
+requests (single-digit ms batching shifts from clock-advance wake-ups
+and pass deadlines; measured mean TTFT +4.38 ms under a handoff fault
+whose mechanism moves latency +100 ms). The disabled path (no
+`--fault-config`) is exactly identical in clocks and CSV.
 
 ## What it cannot model
 
