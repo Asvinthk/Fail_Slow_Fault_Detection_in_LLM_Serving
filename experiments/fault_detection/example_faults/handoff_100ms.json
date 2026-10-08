@@ -1,0 +1,12 @@
+{
+    "faults": [
+        {
+            "fault_id": "handoff_100ms",
+            "target": {"role": "prefill", "instance_id": 0},
+            "injection_layer": "mechanism",
+            "mode": "kv_handoff_delay",
+            "delay_ns": 100000000,
+            "schedule": {"start_s": 1.0, "end_s": 30.0, "profile": "step"}
+        }
+    ]
+}

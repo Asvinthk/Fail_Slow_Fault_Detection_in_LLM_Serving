@@ -1,0 +1,12 @@
+{
+    "faults": [
+        {
+            "fault_id": "decode0_slow_2x",
+            "target": {"role": "decode", "instance_id": 1},
+            "injection_layer": "mechanism",
+            "mode": "compute_multiplicative",
+            "factor": 2.0,
+            "schedule": {"start_s": 1.0, "end_s": 30.0, "profile": "step"}
+        }
+    ]
+}
