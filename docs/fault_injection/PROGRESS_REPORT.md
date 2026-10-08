@@ -27,8 +27,13 @@ server already emits:
 - M2 say fault vs workload skew,
 - M3 localize to a worker or link.
 
-Metrics: detection delay, top-1/top-3 localization, false-positive
-rate under skew, negligible serving overhead.
+Metrics (brief's targets; currently implemented subset: binary
+precision/recall/F1, healthy FPR, stub localisation accuracy with
+abstention rate, detection delay vs window floor, ms per window —
+top-1/top-3 ranking, macro-F1, confusion matrices, per-family FPR,
+and serving-overhead measurement are NOT implemented): detection
+delay, top-1/top-3 localization, false-positive rate under skew,
+negligible serving overhead.
 
 ### Methodology (why simulation first)
 
@@ -40,26 +45,57 @@ collect observable telemetry plus separate ground truth, then train
 transparent baselines first (thresholds, residuals) before any
 heavy model. This separates "can we see it?" from "can we learn it?".
 
-Related work surveyed (arXiv ids from the brief): thermal/ECC/
-interconnect fail-slow studies, RDMA-to-TCP fallback, MoE skew and
-varlen-attention imbalance, PD-disaggregation schedulers. Full
-citations live in the final report; the method follows the standard
-recipe: healthy-only residual model conditioned on batch shape,
-peer-relative features, abstaining localization head.
+LLMServingSim 2.0 is NOT an inference server. It is a cycle-level
+simulator: a Python frontend mirrors vLLM-style continuous batching
+and scheduling, but it executes no model weights — compute timing
+comes from layerwise latency profiles measured with a vLLM-based
+profiler, and ASTRA-Sim analytically models communication cycles
+from Chakra graphs. Hardware is therefore "profiled" or "measured
+on", never "trained on". This project simulates RTX PRO 6000 +
+Llama-3.1-8B; Qwen3-32B profiles are present for scale-up, while
+Llama-3.1-70B has a config but no profile tables and cannot be
+simulated.
 
-### Detector sketch (transparent baselines first)
+The current detector operates on simulator-visible serving telemetry
+only (batch durations, queues, stage stamps, TTFT/ITL stats, KV-send
+counts, exposed-communication proxy). Physical hardware counters from
+the broader problem statement — GPU power/thermal state, SM/GPU
+utilisation, NIC/RDMA counters, clocks/throttling — are not exposed
+through the simulator detection path.
 
-1. Fixed latency thresholds calibrated on one healthy workload.
-2. Residual-only detector: healthy-only regression of iteration
-   duration vs (total_len, num_prefill, n_decode, kv_len),
-   exposed-comm vs pd_kv_send_tokens, ITL vs (n_decode, kv);
-   alarm on residual quantile.
-3. Workload-aware classifier (logistic regression / GBM) only if
-   (2) underperforms on healthy-heavy vs faulty-light pairs.
+Related work actually present in this repo (no complete
+PagedAttention, Sarathi-Serve, or speculative-decoding citations
+exist here — do not cite them as surveyed): SGLang RadixAttention
+attribution for prefix caching (`CHANGELOG.md`, `CONTRIBUTORS.md`);
+DistServe + Mooncake links for PD disaggregation
+(`docs/docs/examples/disaggregated/prefill-decode-split.mdx`);
+speculative decoding only as a contributor-topic bullet, not a
+method. The method follows the standard recipe: healthy-only
+residual model conditioned on batch shape, peer-relative features,
+abstaining localization head.
 
-Features never touch manifest/audit columns (unit-tested).
-Splits group by pair_id/workload_id; held-out workload family and
-cluster config; time-aware split for detection delay.
+### Detector sketch (transparent baselines first — implemented)
+
+1. Fixed latency thresholds calibrated on one healthy workload
+   (`ml/run.py`: p99 of window `dur_mean` on train-healthy windows).
+2. Residual-only detector: healthy-only least-squares regression of
+   iteration duration vs (total_len, num_prefill, n_decode, kv_len)
+   plus exposed-comm vs pd_kv_send_tokens (`ml/features.py`); alarm
+   on the residual quantile.
+3. Workload-aware classifier: logistic regression on the window
+   feature vector. Gradient boosting is NOT implemented (reserved
+   for when residuals demonstrably underperform). No MLP of any kind
+   is implemented, and none is claimed.
+4. Localisation is currently a STUB with abstention, not a learned
+   model: confident-anomalous windows are labeled from ground truth
+   (`ml/run.py`), so its accuracy figure is not a model result and a
+   genuine localisation head is pending work.
+
+Features never touch manifest/audit columns (unit-tested
+`FORBIDDEN_COLUMNS` guard). Splits group by pair_id/workload_id
+(train/test only; no validation split yet); held-out workload family
+and cluster config go to test; detection delay measured as
+first-anomalous-window minus fault onset against the window floor.
 
 ## B. System Design
 
@@ -70,16 +106,23 @@ Workload JSONL ---> Router ---> Prefill pool P ---> KV link L ---> Decode pool D
                         |              |                |                |
                         v              v                v                v
                    Scheduler --> Trace (comp/comm) --> ASTRA-Sim --> add_done
-                                      ^  (FAULT HOOK: scale comp_time /
-                                      |   comm_size for target instance)
-                                      |
-                         fault_injection.py (profiles, targeting, audit)
-                                      |
+                                     ^  (FAULT HOOK, side path only:
+                                     |   scale comp_time / comm_size,
+                                     |   handoff holds, stall guards)
+                                     |
+                        fault_injection.py (profiles, targeting, audit)
+                                     |
         Observable: batch/request telemetry CSVs   Ground truth: audit jsonl + manifest
-                                      |                         |
-                                      v                         v
-                              Feature builder ---> Baselines ---> Report (P/R/F1, delay, confusion)
+        (ONLY detector input)                      (evaluation only: NOT PROVIDED TO DETECTOR)
+                                     |                         |
+                                     v                         v
+                    Feature Extraction --> Healthy Baseline --> Residual/peer features
+                                                               --> Fault Detector --> Fault Localiser
+                                                               --> Diagnosis / Abstain
 ```
+(Diagram as an image: `experiments/fault_detection/smoke/architecture.svg`.
+Detection runs BEFORE localisation; nothing bypasses Feature
+Extraction; no arrow runs from Fault Injection to Healthy Baseline.)
 
 ### Components
 
@@ -101,12 +144,15 @@ Workload JSONL ---> Router ---> Prefill pool P ---> KV link L ---> Decode pool D
 1. Generate paired workloads (healthy/faulty share arrivals).
 2. Run healthy then faulty with identical seeds; write manifest.
 3. Build window features per (run, window, instance, role).
-4. Train on healthy only (residuals), classify, localize with
+4. Score windows with the three baselines; localisation stub with
    abstention (`healthy / prefill / decode / kv-transfer-network /
-   worker-unavailable / unknown`), plus separate mechanism-class task.
-5. Report: PR/F1, FPR on healthy families, localization accuracy +
-   macro-F1 + confusion, delay in sim seconds, abstention rate,
-   inference time per window.
+   worker-unavailable / unknown`). No separate mechanism-classification
+   task is implemented.
+5. Report: binary precision/recall/F1, FPR on healthy windows,
+   stub localisation accuracy, abstention + selective accuracy,
+   detection delay in sim seconds, inference ms per window. NOT
+   implemented: macro-F1, confusion matrices, top-1/top-3 ranking,
+   per-family FPR breakdowns, serving-overhead measurement.
 
 ### Inputs / outputs
 
@@ -142,17 +188,42 @@ telemetry; no cluster-wide probing or traffic pausing.
 
 ## D. Implementation Plan
 
+COMPLETED (verified against code and artifacts before writing):
+
+- fault injection (5 simulator modes, strict validator, audit rules)
+- telemetry (batch/request CSVs, ITL side file, dedupe + id-1 mapping)
+- workloads (seeded Poisson/bursty/sustained generator)
+- paired experiment framework (`generate.py`, shared workload + pair_id)
+- manifest / leak guards (`manifest.py`, unit-tested)
+- three detection baselines (fixed threshold, residual threshold,
+  logistic regression) with abstaining localisation stub
+- deterministic validation (58/58 suite green + 4 recorded fault
+  baselines; reruns bit-identical)
+- smoke evaluation (3 pairs, 5 runs, 0 failed; 40-window ML report)
+
+ONGOING:
+
+- Qwen3-32B scale-up preparation (config + full profile tables verified
+  present; no fault runs yet)
+
+PENDING (not implemented; do not claim):
+
+- Qwen3-32B experiments; full 38-job fault matrix; genuine
+  localisation model; top-1/top-3 localisation; macro-F1/confusion
+  matrix; per-family FPR; workload-skew evaluation at scale; serving
+  overhead measurement; mechanism classification; broader
+  generalisation study
+
 | # | Task | Status | Outcome |
 |---|---|---|---|
-| 1 | Inspect + baseline (Stage 1) | DONE (code reading + findings doc); DOING (binary runs need container) | ARCHITECTURE_FINDINGS.md, RUNLOG.md |
-| 2 | Fault subsystem (Stage 2) | DONE (code+unit tests); DOING (validate.sh + PD determinism in container) | `fault_injection.py`, 7 pytest pass, 4 example faults |
-| 3 | Telemetry (Stage 3) | DOING (batch CSV stub; request CSV + rolling windows TODO) | original CSV untouched, `com_cycle` added compatibly |
-| 4 | Workloads/matrix (Stage 4) | DOING (generator + 1P1D/2P2D configs DONE; full matrix + manifest loader TODO) | smoke-ready scaffolding |
-| 5 | Features + ML (Stage 5) | TODO | transparent baselines, one-command report |
-| 6 | Docs + verification (Stage 6) | DOING (5 docs DONE; full validate + smoke + ML report TODO in container) | this report |
+| 1 | Inspect + baseline (Stage 1) | COMPLETED | ARCHITECTURE_FINDINGS.md; healthy 1661784496 ns x3 identical |
+| 2 | Fault subsystem (Stage 2) | COMPLETED | `fault_injection.py`; 18 injection tests; drop/hold bug found by measurement and fixed |
+| 3 | Telemetry (Stage 3) | COMPLETED | full batch/request schema; `com_cycle` added compatibly; original CSV untouched |
+| 4 | Workloads/matrix (Stage 4) | COMPLETED | generator + 1P1D/2P2D configs + matrix + paired runner + manifest loader |
+| 5 | Features + ML (Stage 5) | COMPLETED as baselines | 3 detectors + stub; one-command report on 40 smoke windows |
+| 6 | Docs + verification (Stage 6) | COMPLETED (this cycle) | validate green; smoke bundle committed; statuses reconciled |
 
-Next steps (in order): run PD baseline twice + `validate.sh
---clocks-only` in container; add fault scenarios to validate.sh;
-finish request telemetry; implement manifest + loader guard;
-generate smoke matrix; run ML baselines; record all outputs in
-RUNLOG.md. One logical change per commit, short imperative messages.
+Next steps (in order): Qwen3-32B 1P1D config; healthy re-baseline
+x2; same-severity fault set + severity ladder; `pd_qwen_fault_*`
+baselines; Qwen smoke + ML report; 8B-vs-32B detectability
+comparison. One logical change per commit, short imperative messages.

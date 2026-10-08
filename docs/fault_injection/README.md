@@ -32,7 +32,8 @@ baselines are byte-identical.
 
 - Original CSV (`--output`): unchanged schema.
 - `experiments/out/.../batch_telemetry.csv`: observable per-batch stats.
-- `<inputs_root>/injection_audit.jsonl`: ground truth, separate file.
+- `injection_audit.jsonl` next to `--telemetry-output` (or `--output`
+  without it): ground truth, separate file, never in telemetry.
 
 ## Limitations
 

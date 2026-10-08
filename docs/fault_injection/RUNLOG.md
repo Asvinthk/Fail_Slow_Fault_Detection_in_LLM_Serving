@@ -131,3 +131,32 @@ Headline: healthy 1661784496 ns (x3 identical runs, two CSV md5
   R 0.556 FPR 0.000; residual-only P 0.857 / R 0.667 F1 0.750;
   logistic P 0.286 / R 0.222 (overfits smoke scale, honest negative);
   localization 0.475, abstention 0.075, delay 1.0 s (2 s floor).
+
+## Submission-readiness pass (host only, no sim runs)
+
+- Verified from committed-equivalent artifacts with
+  `verify_smoke.py` (Windows TEMP, not committed): 40 windows (22
+  healthy, 18 anomalous); whole-set tallies fixed TP=6 FP=0 FN=12
+  TN=22, residual TP=7 FP=1 FN=11 TN=21; split arithmetic
+  cross-checks on all six metrics.csv rows (test = 9 anomalous + 8
+  healthy; train = 9 + 14); thresholds fixed=16646350ns,
+  residual=424168ns. Healthy-heavy decode windows read 11–17 ms with
+  residuals near zero; faulty-light decode windows read ~22 ms with
+  residuals ≈ +11 ms and peer ratios 1.8–2.3; faulty-run prefill
+  windows carry no mechanism effect (label-construction ceiling on
+  recall). No rerun of the smoke matrix: artifacts postdate all
+  behavior-changing commits and sims are deterministic.
+- Committed reproducibility bundle `experiments/fault_detection/smoke/`
+  (23 files, ~491 KB): README, manifest.jsonl, metrics.csv, verified
+  report.md, architecture.svg, per-pair workload + telemetry + audit
+  under `data/`. Raw run dirs (inputs/, logs, sim CSVs, ~30 MB) stay
+  gitignored. `experiments/fault_detection/README.md` added
+  (contribution table, scope notes).
+- `PROGRESS_REPORT.md` reconciled: statuses rewritten to
+  COMPLETED/ONGOING/PENDING, detector sketch matches implemented
+  baselines, localisation stub disclosed, no MLP/GBM/macro-F1/
+  confusion/top-k/mechanism-task claims, related work reduced to
+  repo-present citations, metrics line qualified, HW-counter and
+  profiled-not-trained statements added, diagram fixed with SVG
+  reference. `fault_injection/README.md` stale audit path corrected.
+- `python -m pytest tests/ -q` -> 21 passed on host.
