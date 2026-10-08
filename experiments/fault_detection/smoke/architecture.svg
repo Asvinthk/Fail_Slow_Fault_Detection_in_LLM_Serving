@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="1020" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#1a56db"/>
+    </marker>
+    <marker id="arrD" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#b45309"/>
+    </marker>
+    <marker id="arrS" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="34" font-size="20" font-weight="bold" fill="#111827">Fail-slow fault detection: system architecture</text>
+  <text x="20" y="56" font-size="12" fill="#4b5563">Solid blue = observable path (detector input). Dashed orange = ground truth (never fed to detector).</text>
+
+  <!-- Observable lane background -->
+  <rect x="10" y="70" width="440" height="930" rx="10" fill="#eff6ff" stroke="#1a56db" stroke-width="1.5"/>
+  <text x="24" y="94" font-size="12" font-weight="bold" fill="#1a56db">OBSERVABLE PATH</text>
+
+  <!-- Ground truth lane background -->
+  <rect x="470" y="70" width="280" height="930" rx="10" fill="#fffbeb" stroke="#b45309" stroke-width="1.5" stroke-dasharray="8,5"/>
+  <text x="484" y="94" font-size="12" font-weight="bold" fill="#b45309">GROUND TRUTH (dashed)</text>
+  <text x="484" y="112" font-size="12" font-weight="bold" fill="#b45309">NOT PROVIDED TO DETECTOR</text>
+
+  <!-- Observable boxes -->
+  <g font-size="13" text-anchor="middle">
+    <rect x="70" y="130" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="151" font-weight="bold" fill="#111827">Workload Generator</text>
+    <text x="230" y="169" font-size="11" fill="#4b5563">seeded Poisson / bursty / sustained JSONL</text>
+
+    <rect x="70" y="222" width="320" height="72" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="244" font-weight="bold" fill="#111827">LLMServingSim 2.0</text>
+    <text x="230" y="262" font-size="11" fill="#4b5563">Scheduler / PD runtime (prefill, KV link, decode)</text>
+    <text x="230" y="278" font-size="11" fill="#4b5563">Chakra graphs + ASTRA-Sim cycles</text>
+
+    <rect x="70" y="334" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="355" font-weight="bold" fill="#111827">Observable Telemetry</text>
+    <text x="230" y="373" font-size="11" fill="#4b5563">batch / request CSVs (original CSV untouched)</text>
+
+    <rect x="70" y="426" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="447" font-weight="bold" fill="#111827">Feature Extraction</text>
+    <text x="230" y="465" font-size="11" fill="#4b5563">fixed windows, observable columns only</text>
+
+    <rect x="70" y="518" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="539" font-weight="bold" fill="#111827">Healthy Baseline</text>
+    <text x="230" y="557" font-size="11" fill="#4b5563">regression fitted on HEALTHY runs only</text>
+
+    <rect x="70" y="610" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="631" font-weight="bold" fill="#111827">Residual / Peer Features</text>
+    <text x="230" y="649" font-size="11" fill="#4b5563">observed minus predicted; peer ratios</text>
+
+    <rect x="70" y="702" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="723" font-weight="bold" fill="#111827">Fault Detector</text>
+    <text x="230" y="741" font-size="11" fill="#4b5563">alarm in {0,1} per window</text>
+
+    <rect x="70" y="794" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="815" font-weight="bold" fill="#111827">Fault Localiser</text>
+    <text x="230" y="833" font-size="11" fill="#4b5563">component or abstain (runs AFTER detection)</text>
+
+    <rect x="70" y="886" width="320" height="52" rx="6" fill="#ffffff" stroke="#1a56db" stroke-width="2"/>
+    <text x="230" y="907" font-weight="bold" fill="#111827">Diagnosis / Abstain</text>
+    <text x="230" y="925" font-size="11" fill="#4b5563">report: P/R/F1, delay, abstention rate</text>
+  </g>
+
+  <!-- Observable arrows -->
+  <g stroke="#1a56db" stroke-width="2" marker-end="url(#arr)">
+    <line x1="230" y1="182" x2="230" y2="218"/>
+    <line x1="230" y1="294" x2="230" y2="330"/>
+    <line x1="230" y1="386" x2="230" y2="422"/>
+    <line x1="230" y1="478" x2="230" y2="514"/>
+    <line x1="230" y1="570" x2="230" y2="606"/>
+    <line x1="230" y1="662" x2="230" y2="698"/>
+    <line x1="230" y1="754" x2="230" y2="790"/>
+    <line x1="230" y1="846" x2="230" y2="882"/>
+  </g>
+
+  <!-- Ground truth boxes -->
+  <g font-size="13" text-anchor="middle">
+    <rect x="495" y="150" width="230" height="52" rx="6" fill="#ffffff" stroke="#b45309" stroke-width="2" stroke-dasharray="6,4"/>
+    <text x="610" y="171" font-weight="bold" fill="#111827">Fault Configuration</text>
+    <text x="610" y="189" font-size="11" fill="#4b5563">target, mode, schedule JSON</text>
+
+    <rect x="495" y="242" width="230" height="60" rx="6" fill="#ffffff" stroke="#b45309" stroke-width="2" stroke-dasharray="6,4"/>
+    <text x="610" y="263" font-weight="bold" fill="#111827">Fault Injection</text>
+    <text x="610" y="281" font-size="11" fill="#4b5563">simulator modes only;</text>
+    <text x="610" y="295" font-size="11" fill="#4b5563">not physical root causes</text>
+
+    <rect x="495" y="342" width="230" height="60" rx="6" fill="#ffffff" stroke="#b45309" stroke-width="2" stroke-dasharray="6,4"/>
+    <text x="610" y="363" font-weight="bold" fill="#111827">Audit / Manifest</text>
+    <text x="610" y="381" font-size="11" fill="#4b5563">per-batch applied records;</text>
+    <text x="610" y="395" font-size="11" fill="#4b5563">labels for evaluation only</text>
+  </g>
+
+  <!-- Ground truth arrows -->
+  <g stroke="#b45309" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrD)">
+    <line x1="610" y1="202" x2="610" y2="238"/>
+    <line x1="610" y1="302" x2="610" y2="338"/>
+  </g>
+
+  <!-- Side hook: fault injection into simulator -->
+  <g stroke="#6b7280" stroke-width="2" marker-end="url(#arrS)">
+    <line x1="495" y1="272" x2="394" y2="272"/>
+  </g>
+  <text x="444" y="264" font-size="11" fill="#374151" text-anchor="middle">side hook</text>
+</svg>

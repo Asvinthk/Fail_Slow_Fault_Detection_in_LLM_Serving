@@ -1,0 +1,15 @@
+baseline,split,precision,recall,f1,fpr_healthy,localization_note
+fixed_threshold,train,1.000,0.111,0.200,0.000,
+fixed_threshold,test,1.000,0.556,0.714,0.000,
+residual_only,train,0.667,0.222,0.333,0.071,
+residual_only,test,0.857,0.667,0.750,0.125,
+logistic,train,0.600,0.333,0.429,0.143,
+logistic,test,0.286,0.222,0.250,0.625,
+
+localization_accuracy,0.475
+abstention_rate,0.075
+selective_accuracy,0.594
+mean_detection_delay_s,1.000
+window_granularity_floor_s,2.000
+inference_ms_per_window,4.049
+n_windows,40
