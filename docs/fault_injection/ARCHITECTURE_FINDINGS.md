@@ -65,7 +65,8 @@ without changing ASTRA-Sim. We label that `output_approx` only.
 
 - DP barrier: every DP member must run every wave, dummy batches
   included. Prototype rejects `dp_group` with faults (clear error)
-  instead of risking the silent deadlock in AGENTS.md.
+  instead of risking the silent deadlock where a batch the start NPU
+  cannot claim never completes.
 - `pass` / `pass <tick>` suppression: fault start/end and handoff
   release times are wake-up events; they are folded into the
   clock-advance logic, otherwise an all-idle cluster sleeps past them.

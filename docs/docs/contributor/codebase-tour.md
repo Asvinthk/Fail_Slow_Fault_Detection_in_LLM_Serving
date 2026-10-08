@@ -194,7 +194,6 @@ opportunity.
 | User-facing docs (this site) | `docs/` |
 | Per-module developer notes | `<module>/README.md` (each top-level Python module has one) |
 | Top-level project README | `README.md` |
-| Project context for AI agents | `CLAUDE.md` (mirrors `AGENTS.md`) |
 
 When you change behavior, update the relevant page under
 `docs/`. When you add a feature, also update the module's
