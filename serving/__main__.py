@@ -139,6 +139,43 @@ def _note_batch_built(batch_meta, schedulers, instance_id, batch, current):
     }
 
 
+def _throttle_tick(throttle_manager, gpu_to_instance, throttle_window_busy,
+                   throttle_audit, window_ns, window_end_ns):
+    """Advance per-GPU synthetic load state for one fixed sim-time window.
+
+    Busy fractions come from ACTUAL completed-batch durations attributed to
+    the window in which the batch completes (completion-window accounting,
+    capped at 1.0 for overlapping in-flight batches). Never derived from
+    queue length -- throttling grows queues, so queues must not grow L
+    (that would be circular). Under lockstep SPMD every member NPU of an
+    instance shares the batch duration, so per-instance busy time applies
+    to each of its physical GPUs.
+
+    Only GPUs listed in the throttle config are ticked; unconfigured GPUs
+    have no state and their factor stays 1.0.
+
+    Appends one ground-truth row per configured GPU to throttle_audit
+    (evaluation only -- never merged into batch/request telemetry CSVs).
+    """
+    window_s = window_ns / 1e9
+    window_end_s = window_end_ns / 1e9
+    for gpu_id in throttle_manager.states:
+        instance_id = gpu_to_instance.get(gpu_id)
+        busy_ns = throttle_window_busy.get(instance_id, 0) \
+            if instance_id is not None else 0
+        busy_frac = min(1.0, busy_ns / window_ns) if window_ns > 0 else 0.0
+        edge = throttle_manager.update_window(gpu_id, busy_frac,
+                                              window_s, window_end_s)
+        row = throttle_manager.states[gpu_id].audit_row(window_end_s,
+                                                         busy_frac)
+        row["type"] = "throttle_window"
+        row["instance"] = instance_id
+        if edge is not None:
+            row["edge"] = edge[1]
+        throttle_audit.append(row)
+    throttle_window_busy.clear()
+
+
 def _cluster_config_path(path):
     if os.path.isabs(path):
         return path
@@ -423,6 +460,12 @@ def main():
                         help='seed for fault-injection randomness (currently unused, kept for reproducibility)')
     parser.add_argument('--telemetry-output', type=str, default=None,
                         help='directory for observable telemetry CSVs (batch/request). Original --output CSV is untouched.')
+    parser.add_argument('--throttle-config', type=str, default=None,
+                        help='path to JSON per-GPU synthetic throttling config (accumulated-load with '
+                        'exponential memory, hysteresis, compute-only slowdown). Absent = disabled, byte-identical.')
+    parser.add_argument('--throttle-audit-output', type=str, default=None,
+                        help='directory for the throttle ground-truth audit (throttle_audit.jsonl). Defaults to '
+                        '--telemetry-output dir, else next to --output. Never mixed into telemetry CSVs.')
 
     args = parser.parse_args()
     
@@ -509,6 +552,53 @@ def main():
     pim_models = cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
+    # Synthetic per-GPU throttling is disabled by default. When
+    # --throttle-config is absent, throttle_manager stays None and no new
+    # code path executes below (bit-identical healthy runs).
+    throttle_manager = None
+    throttle_audit = []
+    throttle_batch_start = {}
+    throttle_seen = set()
+    throttle_window_busy = {}
+    throttle_next_window_ns = None
+    throttle_window_ns = 0
+    instance_to_gpus = {}
+    gpu_to_instance = {}
+    if args.throttle_config is not None:
+        from serving.core.gpu_state import (
+            DEFAULTS as _THROTTLE_DEFAULTS,
+            ThrottleManager,
+            apply_throttle_factor,
+            load_throttle_config,
+        )
+        # Same chdir convention as fault_config: the sim chdir'd into
+        # astra-sim/ above, so repo-relative paths need the ".." prefix
+        # while absolute paths are used as-is.
+        throttle_config_path = args.throttle_config
+        if not os.path.isabs(throttle_config_path):
+            throttle_config_path = os.path.join("..", throttle_config_path)
+        throttle_config = load_throttle_config(throttle_config_path)
+        windows = {g.get("window_s", _THROTTLE_DEFAULTS["window_s"])
+                   for g in throttle_config.get("gpus", [])}
+        if len(windows) != 1:
+            raise ValueError("throttle gpus must share one window_s (got %s)"
+                             % sorted(windows))
+        throttle_window_ns = int(windows.pop() * 1e9)
+        for g in throttle_config.get("gpus", []):
+            gid = g["gpu_id"]
+            if not (0 <= gid < total_npu):
+                raise ValueError("throttle gpu_id %r outside [0, %d)"
+                                 % (gid, total_npu))
+        throttle_manager = ThrottleManager(throttle_config)
+        for iid, start in inst2npu_mapping.items():
+            n = instances[iid]["num_npus"]
+            # Physical NPUs only: a prefill instance's shadow receiver
+            # range models the KV transfer, not a GPU, and is excluded.
+            instance_to_gpus[iid] = list(range(start, start + n))
+        for iid, gpus in instance_to_gpus.items():
+            for g in gpus:
+                gpu_to_instance[g] = iid
+        throttle_next_window_ns = throttle_window_ns
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
@@ -756,6 +846,17 @@ def main():
             id = out_dict['id']
             current = out_dict['cycle']
 
+        # Synthetic throttle windows tick on sim time, including idle
+        # jumps: the while loop gives skipped windows u=0 (decay), so
+        # recovery during quiet periods is represented.
+        if throttle_manager is not None and throttle_manager.enabled():
+            while throttle_next_window_ns <= current:
+                _throttle_tick(throttle_manager, gpu_to_instance,
+                               throttle_window_busy, throttle_audit,
+                               throttle_window_ns,
+                               throttle_next_window_ns)
+                throttle_next_window_ns += throttle_window_ns
+
         # Route newly arrived requests to instances based on current load
         if dataset is not None:
             if fault_manager is not None:
@@ -828,6 +929,17 @@ def main():
                                             meta["total_len"], meta["kv_len"],
                                             meta["pd_kv_send_tokens"],
                                             meta["n_waiting"], meta["n_running"], com))
+        # Throttle busy accounting is independent of --telemetry-output:
+        # durations of ACTUAL completed simulated batches (never queue
+        # length). Counted once per batch, on its first reporting NPU.
+        if throttle_manager is not None and throttle_manager.enabled():
+            tkey = (instance_id, id - 1)
+            if tkey not in throttle_seen and tkey in throttle_batch_start:
+                throttle_seen.add(tkey)
+                tdur = current - throttle_batch_start.pop(tkey)
+                if tdur > 0:
+                    throttle_window_busy[instance_id] = \
+                        throttle_window_busy.get(instance_id, 0) + tdur
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -1180,6 +1292,31 @@ def main():
                     if args.telemetry_output is not None:
                         _note_batch_built(batch_meta, schedulers, instance_id,
                                           new_req, current)
+                    if throttle_manager is not None and throttle_manager.enabled():
+                        # Throttle factor for this instance's FUTURE batch
+                        # (in-flight ASTRA-Sim executions cannot be rescaled
+                        # -- same documented limitation as fault injection).
+                        # Lockstep SPMD replicates one trace to all member
+                        # GPUs, so the slowest member sets the batch time.
+                        # Genuine per-rank divergence is NOT supported by the
+                        # converter -- documented limitation, not silently
+                        # faked: compute rows scale uniformly by the max.
+                        gpus = instance_to_gpus[instance_id]
+                        factor = max(throttle_manager.factor_for(g) for g in gpus)
+                        throttle_batch_start[(instance_id, new_req.batch_id)] = current
+                        if factor != 1.0:
+                            nominal, applied = apply_throttle_factor(
+                                trace_data.rows, factor)
+                            throttle_audit.append({
+                                "type": "throttle_batch",
+                                "instance": instance_id,
+                                "batch_id": new_req.batch_id,
+                                "time_ns": current,
+                                "factor": factor,
+                                "nominal_comp_sum": nominal,
+                                "applied_comp_sum": applied,
+                                "applied": True,
+                            })
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1552,6 +1689,28 @@ def main():
             for entry in fault_audit:
                 f.write(json.dumps(entry) + "\n")
         print(f"Fault audit written to: {audit_path} ({len(fault_audit)} records)")
+    if throttle_manager is not None and throttle_manager.enabled():
+        # Ground truth lives apart from observable telemetry: throttle
+        # rows (load, throttled, factor) must never enter detector
+        # feature columns -- same separation as injection_audit.jsonl.
+        if args.throttle_audit_output is not None:
+            throttle_dir = args.throttle_audit_output
+            if not os.path.isabs(throttle_dir):
+                throttle_dir = os.path.join("..", throttle_dir)
+        elif args.telemetry_output is not None:
+            throttle_dir = args.telemetry_output
+        elif output_file is not None:
+            throttle_dir = os.path.dirname(output_file) or "."
+            if not os.path.isabs(throttle_dir):
+                throttle_dir = os.path.join("..", throttle_dir)
+        else:
+            throttle_dir = run_paths.inputs_root
+        os.makedirs(throttle_dir, exist_ok=True)
+        throttle_path = os.path.join(throttle_dir, "throttle_audit.jsonl")
+        with open(throttle_path, "w") as f:
+            for entry in throttle_audit:
+                f.write(json.dumps(entry) + "\n")
+        print(f"Throttle audit written to: {throttle_path} ({len(throttle_audit)} records)")
     if args.telemetry_output is not None:
         os.makedirs(args.telemetry_output, exist_ok=True)
         batch_path = os.path.join(args.telemetry_output, "batch_telemetry.csv")
