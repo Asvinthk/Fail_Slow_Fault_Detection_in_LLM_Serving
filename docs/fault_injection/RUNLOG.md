@@ -160,3 +160,269 @@ Headline: healthy 1661784496 ns (x3 identical runs, two CSV md5
   profiled-not-trained statements added, diagram fixed with SVG
   reference. `fault_injection/README.md` stale audit path corrected.
 - `python -m pytest tests/ -q` -> 21 passed on host.
+
+## Synthetic training study (host only, NOT simulator output)
+
+- Resampled the 40 real smoke windows (22 healthy / 18 anomalous,
+  18-dim observable features) with 0.15-sigma Gaussian jitter,
+  seed 42: train 1000 (100 fail-slow, 10%), val 200 (20), test 300
+  (30). Scripts in Windows TEMP (`ground_stats.py`, `synth_study.py`),
+  not committed. Baselines reuse the run.py protocol (99th pct of
+  healthy TRAIN): fixed=16959038ns, residual=559103ns. Logistic =
+  manual minibatch numpy, batch 32, lr 1e-4, weighted BCE (pos x9),
+  standardized features, 15 epochs as requested.
+- Test result: fixed P 0.600 / R 0.200 F1 0.300 FPR 0.015;
+  residual P 0.833 / R 0.333 F1 0.476 FPR 0.007;
+  logistic P 0.106 / R 0.367 F1 0.164 FPR 0.344.
+- Diagnostic rerun at 200 epochs (same seed/config): loss still
+  falling (1.2455 -> 1.0502), test F1 only 0.200, FPR 0.322.
+  Verdict: the requested lr/epoch budget underfits (465 steps barely
+  move the weights) while pos_weight x9 inflates the intercept, so the
+  model over-fires on healthy windows. Synthetic resample does not
+  validate real-hardware detection; kept out of the repo.
+- v2 (train/test only, no val): same generator, train 1000 (100),
+  test 300 (30). Logistic = StandardScaler (train-fit, constant cols
+  5,6,12,17 dropped), sklearn lbfgs, balanced weights, C=0.1 by
+  5-fold stratified CV on train (cv-F1 0.559), threshold frozen 0.5,
+  converged in 21 iters. Test: fixed P 0.545 / R 0.200 F1 0.293;
+  residual P 0.833 / R 0.333 F1 0.476 FPR 0.007;
+  logistic P 0.395 / R 0.567 F1 0.466 FPR 0.096 (best recall,
+  within 0.01 F1 of residual as predicted). Confirms v1 gap was
+  optimization budget, not signal; residual remains best F1/FPR.
+- v3 (proper weight x C grid, max_iter=20000): 5-fold CV on train
+  over C {0.01..1.0} x weights {balanced, 1:5, 1:3}; chose 1:5/C=0.3
+  (cv-F1 0.673), converged in 26 iters, threshold 0.5. Test:
+  fixed F1 0.390; residual F1 0.565 FPR 0.011;
+  logistic P 0.720 / R 0.600 F1 0.655 FPR 0.026 (18/7/12/263) —
+  first config to beat residual, via weighting not capacity.
+  Plot + metrics CSV in <Project>/plots/ (user-requested; not part
+  of the repo tree).
+- v4 training curves (same data/config 1:5/C=0.3): lbfgs loss-vs-iter
+  via warm-started single steps — 54 iters, train log-loss
+  0.5930 -> 0.2838, train F1 0.306 -> 0.667; test reproduces v3
+  exactly (F1 0.655). Minibatch SGD rerun (bs=32, lr=0.1, 100 ep,
+  lam=1/(C*n)): wBCE 0.5562 -> 0.4086, train F1 to 0.663, test F1
+  0.667 / FPR 0.022 — matches lbfgs within noise. Curve PNG in
+  <Project>/plots/synth_v4_training_curve.png. (max_iter=1
+  ConvergenceWarnings during instrumentation are expected noise.)
+- v5 pure focal loss, no L2 (gamma=2, grad-checked rel-err 2.6e-10):
+  3-fold CV on train-1k over alpha {0.25, 0.5} x batch {8,16,32},
+  lr linear-scaled (0.1@bs32). Batch size did not differentiate
+  within noise (identical CV-F1 across bs per alpha); alpha=0.5 won
+  (0.654 vs 0.523 — mild 1:9 imbalance wants focusing, not positive
+  down-weighting). Winner bs=8 by tiebreak. Stage A test: focal
+  P 1.000 / R 0.533 F1 0.696 FPR 0.000 vs residual 0.723, fixed
+  0.545. Stage B 10x (train 10k/test 3k, same winner): focal F1
+  0.681 FPR 0.000 (155/0/145/2700) vs residual 0.589, fixed 0.509 —
+  learned model held steady while percentile rules degraded on the
+  larger draw. NOTE: first v5 run was voided by a double-shuffle bug
+  (X/y permuted independently — all detectors ~0, caught by the
+  baseline sanity check); fixed to single permutation, reran.
+  Plot + CSV in <Project>/plots/synth_v5_focal.*.
+- v6 alpha grid {0.4, 0.5, 0.6} (bs=8, gamma=2, no L2, thr 0.5,
+  1k stage only): CV-F1 0.569 / 0.578 / 0.588 (monotone but gaps <
+  fold-std ~0.07 — ordering suggestive, not significant). Test:
+  a0.4 F1 0.500 (10/0/20/270); a0.5 = a0.6 F1 0.571 (12/0/18/270),
+  all P 1.000 FPR 0.000 vs residual 0.565, fixed 0.390. The 0.5->0.6
+  tilt moved no extra test window across the frozen 0.5 line
+  (prediction of recall-up/precision-down wrong in detail — discrete
+  threshold saturation, not a smooth tradeoff). Plot + CSV in
+  <Project>/plots/synth_v6_alpha.*. (One voided v6 run: CSV-name
+  parse bug crashed plotting after metrics printed; fixed, reran —
+  training numbers deterministic-identical.)
+
+## Day-simulator build (M0-M6, host + container status as noted)
+
+Scope: resource-aware multi-GPU day simulator on Qwen3-30B-A3B (MoE 128/top-8),
+RTX PRO 6000, TP=2, PP=2 (existing `single_node_moe_pp_instance.json` shape;
+new P/D variant `configs/cluster/moe_pd_tp2_pp2_instance.json`). Full branch
+status at start: HEAD e691da5, `M docs/fault_injection/RUNLOG.md` (prior
+synthetic-study notes, preserved), untracked prior-session scaffolding
+(`day_workload.py`, `gpu_state.py`, tests, moe P/D config) adopted, not reset.
+
+- `git rev-parse HEAD; git status --short` -> e691da5, main; see file list above.
+- `docker ps` -> FAILED: `failed to connect to the docker API at
+  npipe:////./pipe/dockerDesktopLinuxEngine ... The system cannot find the
+  file specified.` Docker daemon down on this host. Consequence: NO container
+  sims possible in this session (no ASTRA-Sim binary on host). All sim runs
+  (M1 smoke, M6 sim comparisons, `validate.sh`) are BLOCKED and recorded as
+  such; host-side verification only.
+- `pytest tests/test_day_workload.py tests/test_gpu_throttle.py tests/test_fault_injection.py tests/test_fault_ml.py -q` -> 31 passed (host, 3.32s).
+- `python -m experiments.fault_detection.day_workload --out $env:TEMP\day_smoke.jsonl --horizon-h 0.25 ...` -> `wrote 354 rows (0.25h horizon)`; first rows valid JSONL schema.
+- Router round-trip FAILED first: `Router.load_requests` with absolute TEMP
+  path -> `OSError: [Errno 22] Invalid argument: '"'"'../C:\\Users\\...'"'"'`.
+  Root cause: `serving/core/router.py:119` unconditionally prefixed `"../"`
+  (runtime chdir convention), breaking absolute paths. Fix: `os.path.isabs`
+  guard (same pattern as fault/telemetry paths in `__main__.py:457,463`);
+  relative behaviour unchanged. Regression test `tests/test_router_paths.py`
+  (absolute + relative-dotdot). Reran both forms: absolute 354 reqs OK,
+  relative 5 reqs (req_num cap) OK.
+- `pytest tests/ -q` -> 33 passed (incl. 2 new router tests).
+- M1 static verification (host): `_resolve_parallelism` on Qwen3-30B-A3B
+  (48 layers, 128 experts): moe_pd_tp2_pp2 -> prefill tp=2 pp=2 ep=2 n=4,
+  decode same (total 8 instance-GPUs; cluster total_npu=12 with prefill
+  shadow range); `single_node_moe_pp_instance` -> tp=2 pp=2 ep=2;
+  `single_node_moe_single_instance` -> tp=2 pp=1 ep=2. EP=TP<=TP, 128%2==0,
+  pp<=48 all pass. Profile check: tp1+tp2 dense/attention/per-seq/skew
+  present; moe.csv tp1-only (analytic per-EP-rank lookup, documented).
+  Deterministic container smoke BLOCKED (docker, above).
+- M5 wiring: 7 edits in `serving/__main__.py` (flags, init+validation,
+  tick, busy accounting, factor hook, audit write) + `_throttle_tick`
+  helper; `python -m py_compile` COMPILE-OK; `python -m serving --help`
+  shows `--throttle-config/--throttle-audit-output`.
+- Validator fix: example config `_comment` key rejected -> allow
+  `_`-prefixed metadata keys; `load_throttle_config` on
+  `example_throttle/decode_pool_moe_pd_tp2_pp2.json` -> gpu_ids [8..11] OK.
+- `pytest tests/ -q` -> 36 passed (incl. compute-only scaling, tick cap).
+- M4 workload stats (host, seed 7, base 2.0): 24h gen 143034 reqs in
+  0.60s wall; peak-hour 23144 vs night 3166 (7.31x); rate noon 8.0 vs
+  3am 0.8; peak disabled -> noon-hour 6152; peak shifted 15h -> max
+  hour 14; repro True.
+- M6 state-model study (TEMP script, NOT simulator output):
+  1 steady u=0.5 -> L=0.500, 0 transitions, never throttled;
+  2 noon-peak thresholds 1.0/0.95 -> peakL 0.881, 0 transitions;
+  3 noon-peak defaults -> 2 transitions (on+off), finalL 0.002 (recovery);
+  4 forced-moderate (th 0.35/0.25) -> throttled, 1 transition;
+  5 prefill-hot/decode-cool -> prefill 2 transitions, decode 0, load 0.2
+  (isolation holds). Two voided runs: tuple-unpack bug (transitions are
+  3-tuples) and a stale summary label; fixed, reran.
+- PP=4 MoE: no config exists and no profile/topology validation run;
+  recorded as UNVERIFIED (not attempted).
+
+## 2P2D TP=2 Qwen3-32B topology (primary, host validation only)
+
+- New `configs/cluster/qwen32_2p2d_tp2.json`: 2 prefill + 2 decode stations,
+  TP=2 each (8 GPUs), Qwen3-32B dense on RTX PRO 6000, link_bw 16 /
+  link_latency 20000 (repo-calibrated defaults, kept per user approval --
+  not PCIe-spec values). Per-pool budgets mirror single_node_heterogeneous.
+- Host check `_resolve_parallelism` x4 -> tp=2 pp=1 ep=1 num_npus=2 each;
+  total_npu=12 (4+4shadow+4). tp2 profile bundle complete (5/5 files).
+  Memory arithmetic: 64GB weights -> 32GB/rank on 96GB cards, fits.
+  64 heads / TP=2 = 32/rank, head-safe.
+- `pytest tests/ -q` -> 36 passed (host).
+- BLOCKED (docker daemon down, re-verified this session): routing proof
+  (both stations serve), deterministic 2x smoke, link_bw sensitivity
+  sweep, `validate.sh`. Next: restart Docker, 10-req smoke x2 identical
+  seeds -> identical Total clocks; telemetry instance_id split nonzero on
+  all 4 instances; then sensitivity 16/32/64.
+- Standing caveats recorded in config `_comment`: no hardware validation
+  for this topology; P0->D0 vs P0->D1 transfer costs identical by
+  construction (per-prefill-instance shadow-range modeling).
+
+## E2E validation session (2026-10-12, Docker available after restart)
+
+HEAD e691da5, branch main. Working tree preserved as found (prior RUNLOG
+notes, validate.unix.sh untouched). No commits. Temp configs/outputs under
+gitignored experiments/out/ only. Helper scripts summarize_run.py,
+phase5_check.py live in experiments/out/ (ignored, not committed).
+
+### Phase 1 -- environment (all commands exit 0 unless noted)
+- `docker ps` initially FAILED (daemon down, npipe missing). Started
+  `C:\Program Files\Docker\Docker\Docker Desktop.exe` (non-destructive),
+  waited 60-90s: daemon up. Pre-existing exited container
+  `servingsim_docker` (image astrasim/tutorial-micro2024) restarted with
+  `docker start` (not recreated).
+- ASTRA-Sim binary present:
+  astra-sim/build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra.
+  Container python3 imports yaml/pandas/numpy/rich/pyinstrument OK.
+- Host `pytest tests/ -q` -> 36 passed (later 37/37 after regression test).
+- Daemon died mid-session (process gone); restarted Docker Desktop again,
+  `docker start servingsim_docker`; bind-mounted outputs intact.
+
+### Phase 2 -- deterministic smoke (qwen32_2p2d_tp2, Qwen3-32B TP=2x2P2D)
+- Workload: `python -m experiments.fault_detection.workloads --out
+  experiments/out/e2e_smoke16.jsonl --num 16 --rate-sps 4.0 --seed 42
+  --pattern poisson --short-in 64 --long-in 512 --short-out 32
+  --long-out 256` -> 16 rows. (gitignored: verified via check-ignore.)
+- r1/r2/r3 identical CLI (`--dtype bfloat16 --block-size 16 --num-reqs 16`,
+  run-ids e2e_r1/r2/r3, telemetry dirs): all completed, 16/16 reqs.
+- Total clocks: r2=r3=9509780493 ns. r1.csv==r2.csv and r2.csv==r3.csv
+  byte-identical (diff -q silent). Determinism PROVEN.
+- Station split (all runs): prefill 0:8/1:8, decode 2:8/3:8. All four
+  stations serve. 1222 batch rows (P:18+18, D:574+612). p50 latency
+  4.42s, p99 7.71s; TTFT p50 57.4ms.
+
+### Phase 3 -- throttling-disabled control: PASS
+- r1/r2/r3 ran without --throttle-config. Telemetry dirs contain exactly
+  batch_telemetry.csv/request_telemetry.csv/request_itls.jsonl; no
+  throttle_audit.jsonl. No --fault-config used (fault hooks untouched).
+
+### Phase 4 -- causal validation (fixed trace e2e_smoke16.jsonl)
+- DEFECT FOUND+FIXED: first thr_B run crashed at first window tick:
+  `_throttle_tick` KeyError: 0 (`__main__.py:165`) -- tick iterated ALL
+  instance GPUs but manager holds only configured ones. Fix: tick iterates
+  manager.states via new gpu_to_instance map; unconfigured GPUs keep
+  factor 1.0. Regression test test_tick_partial_config_ignores...
+  added. Host suite 37/37. (Failing log preserved at
+  experiments/out/e2e_B.log? No -- overwritten by successful rerun;
+  traceback recorded here instead.)
+- B (unreachable th 1.0/0.99, machinery on): clocks 9509780493 ==
+  disabled EXACT. 36 window rows, maxL 0.977, 0 transitions, 0 throttled
+  batches. Deterministic equivalence PROVEN.
+- C (decode GPUs 8-11, th 0.35/0.2, 1.5x, 1s windows): clocks 12537453277
+  (+31.8%). Engage t=2.0s all 4 GPUs. 473 throttled batches factor
+  exactly 1.5 (applied/nominal=1.4999). Latency p50 4.42->5.70s (+29%),
+  p99 7.71->10.55s (+37%). Batch mean 30.7M->40.3M ns (+31%). TTFT
+  p50/p99 IDENTICAL (57.4M/93.0M) -- prefill isolation PROVEN.
+- C2 (same, 2.0x): clocks 15594675002 (+64.0%). p50 7.06s. Monotone
+  magnitude 1.0x/1.5x/2.0x -> 9.51/12.54/15.59s. Ratio exact 2.0000.
+- D (burst-gap-burst 35-req day_workload trace, thr_C): 105.4s sim.
+  Transitions on@18 -> off@31/40 -> on@46 -> off@52 -> on@70/72 ->
+  off@82/85 -> on@95 -> off@100 -> on@105(end). Full hysteresis cycling,
+  per-instance independence (D0 off@31 vs D1 off@40). Recovery PROVEN.
+  1085 throttled batches @1.5x exact.
+- Check 10: ml/features.py untouched (git status clean for it);
+  batch/request telemetry headers contain no throttle columns.
+
+### Phase 5 -- workload integration: PASS
+- poisson/bursty/sustained/day_workload CLI all generate (5/5/5/21 rows).
+- phase5_check.py: workload arrivals == telemetry arrival_ns EXACT
+  (16.6s..103.3s, monotonic), burst2 cohort (15 reqs after t=60s)
+  present, last completion 105.4s > last arrival 103.3s (drain observed).
+  Sim consumed generated timestamps verbatim.
+
+### Phase 6 -- link_bw sweep (temp configs, 16-req trace): DONE
+- bw16/32/64 clocks: 9509780493 / 9445550736 (-0.68%) / 9413781388
+  (-1.01%). Same 1222 batches + routing; TTFT p50 57.4M->48.0M->43.2M
+  (transfer on prefill critical path, responds to BW); batch max
+  93.0M->74.8M->65.6M. Compute dominates; comm partially on critical
+  path. No PCIe/NVLink claims (ring-formula abstraction, per plan).
+
+### Phase 7 -- regression
+- Host suite final: 37/37 pass.
+- `validate.sh --clocks-only`: FIRST attempt failed environmentally
+  (ran stripped copy from /tmp -> REPO_ROOT misresolved to /tmp:
+  `No module named serving`). SECOND attempt ran full suite: 62 FAIL
+  lines, ALL with +0.0000% delta, 0 nonzero, 0 unfinished -- root cause:
+  CRLF working copy makes awk $2 carry \r so string compare fails
+  (baselines file is CRLF; AGENTS.md documents this pitfall). Spot
+  re-run with CR-stripped baselines copy (BASELINES=/tmp/..., zero repo
+  changes): single/pd/pd_fault_decode_mult all PASS, incl. fault
+  baseline 2318421829 == DESIGN.md recorded value (fault hooks
+  untouched). Temp `serving/.validate_tmp.sh` removed afterwards.
+- Nothing staged: git status shows only intended source/doc/test files;
+  all sim outputs + temp configs under ignored experiments/out/.
+
+## Dataset + demo showcase session (2026-10-12, container, Qwen3-32B 2P2D TP=2)
+
+Paired 16-req dataset (identical trace e2e_smoke16.jsonl, seed 42):
+- A healthy (e2e_r2): clocks 9509780493.
+- B unreachable-threshold: identical clocks (prior session).
+- C throttled 1.5x decode (thr_C.json): clocks 12537453277 (+31.8%).
+- C2 throttled 2.0x (thr_C2.json): clocks 15594675002 (+64.0%).
+- F faulty decode 2x both stations (experiments/out/demo_fault.json --
+  NOTE: first attempt failed validation on a _comment key (strict
+  fault_injection validator); removed the key, no code change):
+  clocks 15559896675 (+63.6%), 523 fault audit rows, p50 7.78s,
+  TTFT p50 66.4ms (backpressure vs 57.4 healthy).
+- FT faulty + throttled 1.5x: clocks 21665154168 (+127.8%), p50
+  10.83s, p99 19.68s, 523 fault + 571 throttle audit rows, 487
+  throttled batches @1.5 exact, GPUs 8-11 mean_busy ~96.7%,
+  throttled 20/21 windows. Effects compound (21.7 > 15.6, 12.5).
+Daily demo (demo_day.jsonl, 71 reqs/30min, seed 7): healthy run
+demo_H clocks 1773499805661 (29.6 sim-min), wall ~2.5h. Telemetry:
+p50 latency 4.5s, TTFT p50 72ms, prefill busy 0.3%, decode ~19% each,
+peak minute 5 req, max queue depth 2. Light load: daily SHAPE shown,
+no queueing pressure at this volume (documented, not a failure).
+Cost datum: 71 heavy reqs ~= 2.5h wall; full-volume 24h sims are
+wall-clock-prohibitive -- scaled/compressed demos required.
