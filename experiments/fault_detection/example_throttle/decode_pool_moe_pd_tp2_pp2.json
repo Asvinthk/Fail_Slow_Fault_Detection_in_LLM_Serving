@@ -1,0 +1,9 @@
+{
+    "_comment": "Synthetic per-GPU throttling example for configs/cluster/moe_pd_tp2_pp2_instance.json (Qwen3-30B-A3B, RTX PRO 6000, TP=2 PP=2). Cluster total_npu=12: instance 0 (prefill) owns physical NPUs 0-3 plus shadow receiver range 4-7 (transfer fiction, NOT a GPU -- never list here); instance 1 (decode) owns NPUs 8-11. This file throttles the decode pool only, for the prefill-vs-decode ablation. gpu_ids are NPU indices; out-of-range ids are rejected at startup. L is a dimensionless workload-history accumulator, NOT temperature. Disabled unless passed via --throttle-config.",
+    "gpus": [
+        {"gpu_id": 8, "tau_s": 600.0, "alpha": 1.0, "th_on": 0.75, "th_off": 0.60, "slowdown_factor": 1.5, "m_min": 0.5, "window_s": 60.0},
+        {"gpu_id": 9, "tau_s": 600.0, "alpha": 1.0, "th_on": 0.75, "th_off": 0.60, "slowdown_factor": 1.5, "m_min": 0.5, "window_s": 60.0},
+        {"gpu_id": 10, "tau_s": 600.0, "alpha": 1.0, "th_on": 0.75, "th_off": 0.60, "slowdown_factor": 1.5, "m_min": 0.5, "window_s": 60.0},
+        {"gpu_id": 11, "tau_s": 600.0, "alpha": 1.0, "th_on": 0.75, "th_off": 0.60, "slowdown_factor": 1.5, "m_min": 0.5, "window_s": 60.0}
+    ]
+}
