@@ -1,5 +1,6 @@
 import bisect
 import json
+import os
 import random
 from .logger import get_logger
 
@@ -116,7 +117,11 @@ class Router:
         pending queue. Subsequent sub-requests are released dynamically
         via notify_request_completed() when predecessors finish.
         """
-        path = f'../{path}'
+        # The sim chdir's into astra-sim/ at runtime, so repo-relative
+        # dataset paths need the ".." prefix; absolute paths are used as-is
+        # (same convention as fault_config/telemetry_output in __main__.py).
+        if not os.path.isabs(path):
+            path = f'../{path}'
         self._enable_prefix_caching = enable_prefix_caching
         self._is_init = is_init
         loaded_lines = 0
