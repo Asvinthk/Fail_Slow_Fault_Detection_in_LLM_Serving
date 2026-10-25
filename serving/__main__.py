@@ -27,7 +27,9 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
-from serving.core.timing_jitter import apply_timing_jitter
+# Fault mechanisms, synthetic throttling, benign jitter and audit rows all
+# live in one module (serving/core/fault_study.py).
+from serving.core.fault_study import apply_timing_jitter
 import sys as flush
 
 from pyinstrument import Profiler
@@ -138,43 +140,6 @@ def _note_batch_built(batch_meta, schedulers, instance_id, batch, current):
         "n_waiting": len(schedulers[instance_id].waiting),
         "n_running": len(schedulers[instance_id].running),
     }
-
-
-def _throttle_tick(throttle_manager, gpu_to_instance, throttle_window_busy,
-                   throttle_audit, window_ns, window_end_ns):
-    """Advance per-GPU synthetic load state for one fixed sim-time window.
-
-    Busy fractions come from ACTUAL completed-batch durations attributed to
-    the window in which the batch completes (completion-window accounting,
-    capped at 1.0 for overlapping in-flight batches). Never derived from
-    queue length -- throttling grows queues, so queues must not grow L
-    (that would be circular). Under lockstep SPMD every member NPU of an
-    instance shares the batch duration, so per-instance busy time applies
-    to each of its physical GPUs.
-
-    Only GPUs listed in the throttle config are ticked; unconfigured GPUs
-    have no state and their factor stays 1.0.
-
-    Appends one ground-truth row per configured GPU to throttle_audit
-    (evaluation only -- never merged into batch/request telemetry CSVs).
-    """
-    window_s = window_ns / 1e9
-    window_end_s = window_end_ns / 1e9
-    for gpu_id in throttle_manager.states:
-        instance_id = gpu_to_instance.get(gpu_id)
-        busy_ns = throttle_window_busy.get(instance_id, 0) \
-            if instance_id is not None else 0
-        busy_frac = min(1.0, busy_ns / window_ns) if window_ns > 0 else 0.0
-        edge = throttle_manager.update_window(gpu_id, busy_frac,
-                                              window_s, window_end_s)
-        row = throttle_manager.states[gpu_id].audit_row(window_end_s,
-                                                         busy_frac)
-        row["type"] = "throttle_window"
-        row["instance"] = instance_id
-        if edge is not None:
-            row["edge"] = edge[1]
-        throttle_audit.append(row)
-    throttle_window_busy.clear()
 
 
 def _cluster_config_path(path):
@@ -498,9 +463,11 @@ def main():
     # so the audit can show the stall took effect (absence of batches).
     stall_skips = {}
     if args.fault_config is not None:
-        from serving.core.fault_injection import (
-            load_fault_config, severity_weight, fault_matches,
-            is_stalled, apply_to_trace_rows,
+        from serving.core.fault_study import (
+            load_fault_config, severity_weight,
+            is_stalled, apply_to_trace_rows, select_handoff_hold,
+            audit_handoff_hold, note_stall_skip, audit_stall_windows,
+            attach_batch_context,
         )
         # The sim chdir'd into astra-sim/ above, so repo-relative paths
         # need the same ".." prefix as the cluster config and dataset.
@@ -573,11 +540,13 @@ def main():
     instance_to_gpus = {}
     gpu_to_instance = {}
     if args.throttle_config is not None:
-        from serving.core.gpu_state import (
-            DEFAULTS as _THROTTLE_DEFAULTS,
+        from serving.core.fault_study import (
+            THROTTLE_DEFAULTS as _THROTTLE_DEFAULTS,
             ThrottleManager,
             apply_throttle_factor,
             load_throttle_config,
+            tick_throttle,
+            audit_throttle_batch,
         )
         # Same chdir convention as fault_config: the sim chdir'd into
         # astra-sim/ above, so repo-relative paths need the ".." prefix
@@ -859,10 +828,10 @@ def main():
         # recovery during quiet periods is represented.
         if throttle_manager is not None and throttle_manager.enabled():
             while throttle_next_window_ns <= current:
-                _throttle_tick(throttle_manager, gpu_to_instance,
-                               throttle_window_busy, throttle_audit,
-                               throttle_window_ns,
-                               throttle_next_window_ns)
+                tick_throttle(throttle_manager, gpu_to_instance,
+                              throttle_window_busy, throttle_audit,
+                              throttle_window_ns,
+                              throttle_next_window_ns)
                 throttle_next_window_ns += throttle_window_ns
 
         # Route newly arrived requests to instances based on current load
@@ -980,18 +949,8 @@ def main():
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
             if fault_manager is not None:
                 now_s = current / 1e9
-                handoff_delay = 0
-                handoff_fault = None
-                for fault in fault_manager["faults"]:
-                    if fault["mode"] != "kv_handoff_delay":
-                        continue
-                    if not fault_matches(fault, "prefill", instance_id):
-                        continue
-                    weight = severity_weight(fault["schedule"], now_s)
-                    candidate = int(round(weight * fault["delay_ns"]))
-                    if candidate > handoff_delay:
-                        handoff_delay = candidate
-                        handoff_fault = fault
+                handoff_delay, handoff_fault = select_handoff_hold(
+                    fault_manager["faults"], "prefill", instance_id, now_s)
                 stalled_decode = set()
                 for inst in instances:
                     if inst.get("pd_type") == "decode":
@@ -1000,16 +959,10 @@ def main():
                 if handoff_delay > 0:
                     for req in finished_reqs:
                         held_transfers.append((current + handoff_delay, req))
-                    fault_audit.append({"type": "handoff_hold",
-                                        "fault_id": handoff_fault["fault_id"],
-                                        "mode": "kv_handoff_delay",
-                                        "weight": severity_weight(handoff_fault["schedule"], now_s),
-                                        "instance": instance_id,
-                                        "time_ns": current, "delay_ns": handoff_delay,
-                                        "count": len(finished_reqs),
-                                        "nominal_comp_sum": 0, "applied_comp_sum": 0,
-                                        "nominal_comm_sum": 0, "applied_comm_sum": 0,
-                                        "applied": True})
+                    fault_audit.append(audit_handoff_hold(
+                        handoff_fault, instance_id, current, handoff_delay,
+                        len(finished_reqs),
+                        severity_weight(handoff_fault["schedule"], now_s)))
                 else:
                     if args.telemetry_output is not None:
                         for req in finished_reqs:
@@ -1045,14 +998,8 @@ def main():
                 # The stall took effect here: no batch scheduled. Count it
                 # so the audit shows the window (absence of batches is the
                 # evidence for fail-stop).
-                for fault in fault_manager["faults"]:
-                    if fault["mode"] != "worker_stall":
-                        continue
-                    if not fault_matches(fault, role, instance_id):
-                        continue
-                    if severity_weight(fault["schedule"], current / 1e9) > 0:
-                        key = (fault["fault_id"], instance_id)
-                        stall_skips[key] = stall_skips.get(key, 0) + 1
+                note_stall_skip(stall_skips, fault_manager["faults"], role,
+                                instance_id, current / 1e9)
             else:
                 new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
         else:
@@ -1310,9 +1257,8 @@ def main():
                             fault_manager["faults"], trace_data.rows,
                             role, instance_id, current / 1e9)
                         for entry in entries:
-                            entry.update({"batch_id": new_req.batch_id, "instance": instance_id,
-                                          "time_ns": current})
-                            fault_audit.append(entry)
+                            fault_audit.append(attach_batch_context(
+                                entry, new_req.batch_id, instance_id, current))
                     if args.telemetry_output is not None:
                         _note_batch_built(batch_meta, schedulers, instance_id,
                                           new_req, current)
@@ -1331,16 +1277,9 @@ def main():
                         if factor != 1.0:
                             nominal, applied = apply_throttle_factor(
                                 trace_data.rows, factor)
-                            throttle_audit.append({
-                                "type": "throttle_batch",
-                                "instance": instance_id,
-                                "batch_id": new_req.batch_id,
-                                "time_ns": current,
-                                "factor": factor,
-                                "nominal_comp_sum": nominal,
-                                "applied_comp_sum": applied,
-                                "applied": True,
-                            })
+                            throttle_audit.append(audit_throttle_batch(
+                                instance_id, new_req.batch_id, current,
+                                factor, nominal, applied))
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1681,20 +1620,8 @@ def main():
         # Stall windows never touch trace rows, so they leave no per-batch
         # record. Summarize them here instead: skipped schedule polls are
         # the evidence the stall took effect (absence of batches).
-        for (stall_fault_id, stall_inst), skipped in stall_skips.items():
-            stall_fault = next(
-                f for f in fault_manager["faults"]
-                if f["fault_id"] == stall_fault_id)
-            fault_audit.append({
-                "type": "worker_stall_window", "fault_id": stall_fault_id,
-                "mode": "worker_stall", "weight": 1.0,
-                "instance": stall_inst,
-                "time_ns": int(stall_fault["schedule"]["start_s"] * 1e9),
-                "skipped_schedules": skipped,
-                "nominal_comp_sum": 0, "applied_comp_sum": 0,
-                "nominal_comm_sum": 0, "applied_comm_sum": 0,
-                "applied": skipped > 0,
-            })
+        fault_audit.extend(audit_stall_windows(stall_skips,
+                                              fault_manager["faults"]))
         # inputs_root is deleted after a successful run unless
         # --keep-inputs, so the audit must live somewhere persistent:
         # next to --telemetry-output if given, else next to --output.

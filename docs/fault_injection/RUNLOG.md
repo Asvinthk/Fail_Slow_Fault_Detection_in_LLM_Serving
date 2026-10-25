@@ -426,3 +426,250 @@ peak minute 5 req, max queue depth 2. Light load: daily SHAPE shown,
 no queueing pressure at this volume (documented, not a failure).
 Cost datum: 71 heavy reqs ~= 2.5h wall; full-volume 24h sims are
 wall-clock-prohibitive -- scaled/compressed demos required.
+
+## Consolidation + instrument-repair session (2026-10-25, host + container)
+
+The instrument was reviewed, the measurement defects fixed, and the code
+consolidated from 15 modules into 4 + 1 notebook. Commands and outputs
+below are the executed record; `report.md` §16 is the written account.
+
+### 1. Host unit tests
+
+```
+python -m pytest tests\ -q
+-> 90 passed in 3.94s
+```
+
+(88 after the module merge; +2 in this session:
+`test_probe_run_ids_are_disjoint_and_path_safe` and
+`test_calibrate_stays_inside_its_explicit_bracket`, plus the alpha cases
+added to `test_config_validation`.)
+
+### 2. Smoke recheck: the five frozen clocks still hold
+
+```
+python -u -m experiments.fault_detection.inject_faults \
+  --matrix experiments/fault_detection/matrix.yaml --profile smoke \
+  --out experiments/out/smoke_recheck2
+```
+
+| run | clocks (ns) | applied | U_decode |
+|---|---|---|---|
+| light_poisson healthy | 7667807319 | False | 0.541 |
+| light_poisson faulty (decode x2) | 8387062877 | True | 0.824 |
+| heavy_poisson healthy | 4862442514 | False | 0.995 |
+| bursty healthy | 8794093936 | False | 0.997 |
+| bursty faulty (handoff 100 ms) | 8894547812 | True | 0.997 |
+
+All five are **bit-identical** to the frozen bundle in
+`experiments/fault_detection/smoke/data/manifest.jsonl`; `0 failed run(s)`.
+This is the check that the refactor changed no simulator behaviour.
+
+The first attempt (`experiments/out/smoke_recheck`) failed it and found a
+real defect: `_build_workload` did `params.pop("pattern", "poisson")`, so
+every `bursty` workload was generated as Poisson. Symptom: bursty healthy
+clocks `4862442514` == heavy healthy clocks `4862442514` (the bursty run
+was silently the heavy run). Fixed by keeping `pattern` in the params and
+pinned by `test_build_workload_keeps_the_requested_pattern`.
+
+### 3. Re-evaluating the frozen smoke bundle with the repaired instrument
+
+```
+python -m experiments.fault_detection.evaluate \
+  --data experiments/fault_detection/smoke/data \
+  --report %TEMP%\smoke_new
+-> wrote metrics.csv, report.md and windows.csv (33 windows)
+```
+
+| | pre-fix (frozen `smoke/metrics.csv`) | post-fix |
+|---|---|---|
+| windows | 40 (22 "anomalous") | 33 (8 root_cause, 25 unaffected, 7 downstream excluded) |
+| fixed threshold, test | P 1.000 / R 0.556 | P 1.000 / R 1.000 (5/5), FPR 0.000 |
+| residual, test | P 0.857 / R 0.667 | P 1.000 / R 1.000 (5/5), FPR 0.000 |
+| localisation | 0.475 (stub that echoed ground truth) | top-1 0.875, coverage 0.625, selective top-1 1.000 |
+| detection delay | 1.0 s | 1.5 s mean (0.5 s stride) |
+
+Read this as a **label/feature fix, not a performance gain**: the old run
+labelled every window inside the schedule window anomalous (including
+downstream windows where the target instance was not the slow one), and
+the old localiser copied the ground-truth label. Recall is now computed
+over 8 root-cause windows instead of 18 mixed ones, and the confidence
+interval is wide (recall CI [0.566, 1.000] with 1 test run). The frozen
+bundle stays in the repo as the clock baseline; its `metrics.csv` is
+historical.
+
+### 4. Load calibration, 2P2D tp=1, Llama-3.1-8B
+
+```
+python -u -m experiments.fault_detection.run_simulation calibrate \
+  --cluster configs/cluster/pd_2p2d_small.json --target-u 0.40 \
+  --out experiments/out/pilot_2p2d_u40 --num-reqs 20 --iters 4 \
+  --tol 0.08 --seed 11
+```
+
+| probe | lambda (req/s) | U_decode | U_prefill | TPOT p50 | span |
+|---|---|---|---|---|---|
+| 0 | 1.789 | 0.837 | 0.012 | 11.36 ms | 13.5 s |
+| 1 | 0.299 | 0.230 | 0.002 | 11.27 ms | 74.4 s |
+| 2 | 0.731 | 0.507 | 0.005 | 11.28 ms | 31.0 s |
+| 3 | 0.468 | 0.346 | 0.003 | 11.28 ms | 47.9 s |
+
+chosen `lambda=0.468/s (U_decode=0.346, target 0.40)`. Two facts worth
+recording: (a) decode utilisation is far from linear in lambda and
+saturates quickly, so the matrix's original guess of 0.78 req/s for
+U=0.40 was ~0.2 too high; (b) U is measured per run, and the same lambda
+gave U_decode 0.688 at 40 requests vs 0.837 at 20, so a regime is only
+meaningful with its request count and span attached.
+
+### 5. Defect found while calibrating: shared ASTRA-Sim input tree
+
+Two calibration processes were started against the same out-root (one
+was thought to have died -- it had not; a PowerShell-mangled `grep -E
+"a|b"` had turned into a pipe and hid it). Both used simulator
+`run_id="probe_01"`, and `build_run_paths` places the ASTRA-Sim input
+tree at the *shared* `astra-sim/inputs/runs/<run_id>`, so each run
+rewrote the other's workload while it was being read. Nothing crashed and
+no warning was printed: the failure mode is a silently mixed trace.
+
+Fixed by `probe_run_id(out_root, tag)`, which puts the out-root basename
+in the run id (`pilot_2p2d_u40_probe_01`), and pinned by
+`test_probe_run_ids_are_disjoint_and_path_safe`. The calibration CLI also
+gained `--lambda-lo/--lambda-hi`, because the default two-decade bracket
+spends probes above saturation where U is flat (pinned by
+`test_calibrate_stays_inside_its_explicit_bracket`).
+
+### 6. Load calibration, 2P2D tp=1, target U_decode 0.75
+
+```
+python -u -m experiments.fault_detection.run_simulation calibrate \
+  --cluster configs/cluster/pd_2p2d_small.json --target-u 0.75 \
+  --out experiments/out/pilot_2p2d_u75 --num-reqs 44 --iters 2 \
+  --lambda-lo 0.5 --lambda-hi 3.0 --tol 0.08 --seed 12
+```
+
+| probe | lambda (req/s) | U_decode | U_prefill | TPOT p50 | span |
+|---|---|---|---|---|---|
+| 0 | 2.191 | 0.837 | 0.018 | 11.4 ms | 25.0 s |
+| 1 | 1.621 | 0.723 | 0.016 | 11.4 ms | 27.1 s |
+
+chosen `lambda=1.621/s (U_decode=0.723, target 0.75)`, 44 requests.
+Measured again inside the matrix, the same lambda gave U_decode 0.849,
+0.897 and 0.929 on three different seeds: at 44 requests U_decode varies
++/-0.13 run to run, so the matrix regime table reports the median with
+the run count attached and never a single-run value.
+
+### 7. Parallel workers: proved safe before using them
+
+`--workers 3` was used for the matrix, which is only defensible if the
+workers cannot touch each other's files. The smoke profile was re-run
+three ways and the five clocks compared bit for bit:
+
+```
+python -m experiments.fault_detection.inject_faults \
+  --matrix experiments/fault_detection/matrix.yaml \
+  --profile smoke --out /tmp/smoke_par --workers 3
+```
+
+| run | sequential clocks (ns) | 3 workers (ns) |
+|---|---|---|
+| light_poisson healthy | 7667807319 | 7667807319 |
+| light_poisson faulty | 8387062877 | 8387062877 |
+| heavy_poisson healthy | 4862442514 | 4862442514 |
+| bursty healthy | 8794093936 | 8794093936 |
+| bursty faulty | 8894547812 | 8894547812 |
+
+Identical. The workers are safe because every run id is disjoint (the
+pair id contains the seed and the noise level) and each run owns its own
+`inputs_*` tree; the shared ASTRA-Sim input tree defect from item 5 was
+what made this unsafe before.
+
+Three workers, not more: `--workers 6` was tried on the same smoke
+profile and never finished. One simulator sat at 99.9% CPU for 11
+minutes on a 10-request run that takes ~40 s, so the attempt was killed
+and `/tmp/smoke_w6` removed. The cause was not diagnosed, so the matrix
+runs at the proven level of 3 and no throughput claim is made beyond it.
+At 3 workers the container uses ~55% of one core, i.e. the run is I/O
+bound on the Windows bind mount, not CPU bound.
+
+### 8. Three defects found while validating the matrix
+
+All three were silent (no crash, no warning):
+
+1. `_build_workload` popped `pattern` out of the workload dict before
+   building it, so a `pattern: bursty` workload was generated as Poisson.
+   The bursty load-matched negative was therefore not bursty. Fixed by
+   keeping `pattern` in the dict; pinned by
+   `test_build_workload_keeps_the_requested_pattern`.
+2. The manifest was flushed once per PAIR, not per run. A pair is 1-12
+   simulator runs (20-40 min), so one bad run at the end lost the whole
+   pair's manifest lines and the work had to be re-simulated. Now flushed
+   per run under a `threading.Lock`; pinned by
+   `test_manifest_is_flushed_per_run_not_per_pair`.
+3. The throttle template used `tau_s=20.0`, but the accumulator
+   `L(t) = u*(1-exp(-t/tau))` cannot reach `th_on=0.55` inside a 20-25 s
+   review run, so the throttle never engaged and the run was a silent
+   neutral. `tau_s` is now 8.0; pinned by
+   `test_throttle_template_can_fire_inside_a_review_run`. `alpha` is also
+   validated to `(0, 1]` instead of being trusted.
+
+### 9. Defect: `evaluate` silently dropped every faulty run of the matrix
+
+First evaluation of the partial `review_min` matrix returned 201 windows,
+ALL labelled `unaffected`, `n_root_cause=0`, although the audits showed
+`applied: true, instance: 3` on 1467 batches.
+
+Cause: `inject_faults` names a twin's telemetry directory after its
+suffix, and a pair with several fault variants writes `faulty0_telemetry`
+... `faulty5_telemetry`; `evaluate.collect_dataset` derived the directory
+from `fault_present` and looked for `faulty_telemetry`. That directory
+does not exist, so every faulty run hit a bare `continue` and only the
+healthy twins were scored. The result looked like "the detector found
+nothing" rather than "the instrument read nothing".
+
+Fixes: the manifest now records `telemetry_dir` per run; `evaluate`
+resolves it from the manifest, falls back to the `run_id` tail (which is
+exactly the directory stem, so bundles written before the field existed
+still resolve to their OWN twin rather than to twin 0), then to the
+healthy/faulty default; and a run whose telemetry cannot be found is
+reported (`skipped_runs`, `n_runs_missing_telemetry`) instead of being
+dropped. Pinned by
+`test_multi_variant_pair_resolves_each_telemetry_dir`,
+`test_legacy_manifest_without_telemetry_dir_still_resolves`,
+`test_legacy_multi_variant_manifest_resolves_by_run_id` and
+`test_missing_telemetry_dir_is_reported_not_silently_dropped`.
+
+Also fixed while re-reading the report writer: the bootstrap section
+printed its heading whenever ANY row had a bootstrap interval, so a
+single-run test split printed "Bootstrap over runs" with no rows under
+it.
+
+### 10. Finding: `kv_transfer_bandwidth` carries no latency signal
+
+The three transfer-bandwidth severities of `review_u40_small_2p2d_1`
+produce bit-identical total clocks:
+
+| run | bandwidth_fraction | total clocks (ns) | U_decode |
+|---|---|---|---|
+| healthy | - | 43040878835 | 0.387 |
+| faulty3 | 0.80 | 43043305415 | 0.387 |
+| faulty4 | 0.67 | 43043305415 | 0.387 |
+| faulty5 | 0.50 | 43043305415 | 0.387 |
+
+The mechanism does change the trace -- the audit reports
+`nominal_comm_sum` 10878976 scaled to 13598720 / 16237280 / 21757952,
+i.e. exactly 1.25x / 1.5x / 2.0x, `applied=true` on all 9 audited
+batches -- and the simulation still lands on the same nanosecond for all
+three. There is no dose-response at this operating point, so there is
+nothing for a detector to find; the family is an honest negative, not a
+detector failure.
+
+Consequence for the metric: scoring these windows as positives would
+count a guaranteed miss against every detector, so `evaluate` now
+classifies a fault family as timing-neutral when (a) two or more
+severities give bit-identical total clocks, or (b) a single severity
+reproduces the healthy twin's clocks exactly, and excludes its windows as
+`neutral` (reported, never silently). Missing clocks never imply
+neutrality. Pinned by
+`test_timing_neutral_mechanism_is_excluded_not_scored`,
+`test_dose_response_keeps_a_family_scoreable` and
+`test_fault_that_moves_clocks_stays_a_positive`.

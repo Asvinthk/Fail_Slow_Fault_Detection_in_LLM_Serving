@@ -57,10 +57,30 @@ Full ITL lists live in the side file `request_itls.jsonl`
 ## Rolling window aggregates
 
 Computed offline from the two files (see
-`experiments/fault_detection/ml/features.py:build_windows`); window
-length configurable, each window stamped with window-end sim time.
+`experiments/fault_detection/evaluate.py:build_windows`); window length
+configurable (default 2 s), each window bucketed by the batch's
+`finish_ns` so features and labels land in the same bucket. Features are
+per (window, instance), never pooled across instances: a per-instance
+z-score against leave-one-out peer medians is what makes localisation
+possible, and pooling would average the culprit away.
+
+`batch_id` in the telemetry is the scheduler batch id plus one
+(`REPORT_ID_OFFSET = 1`); the schedule-time snapshot is read back through
+that mapping.
+
+## Benign noise
+
+`--timing-jitter SIGMA` adds a seeded, mean-preserving lognormal
+multiplier to per-layer compute rows only (never communication), keyed
+per instance/batch/row so it is order-independent. `SIGMA = 0` is a
+byte-for-byte no-op and keeps `Total clocks (ns)` bit-identical, so the
+regression baselines stay valid. Without it the simulator is a
+deterministic table lookup and healthy residuals have almost no spread.
 
 ## Ground truth (NEVER in observable files)
 
-`injection_audit.jsonl` + manifest only. A loader test must fail
-if an observable file contains manifest-only columns.
+`injection_audit.jsonl`, `throttle_audit.jsonl` and `manifest.jsonl`
+only. A loader test must fail if an observable file contains
+manifest-only columns, and a second test must fail if an observable
+*value* spells out the label (e.g. a `run_id` containing "faulty");
+matrix runs therefore use an opaque hashed `run_id`.

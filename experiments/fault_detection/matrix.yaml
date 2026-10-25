@@ -1,12 +1,23 @@
 # Experiment matrix for fail-slow fault-detection research.
-# Paired runs: each (workload, cluster, seed) runs healthy then faulty
-# with identical arrivals and lengths; the pair shares a pair_id.
-# Workload parameters are sampled independently of fault parameters;
-# the matrix deliberately includes healthy-high-load and faulty-low-load
-# pairs so workload-vs-fault discrimination is tested, not assumed.
 #
-# Severity ladder: 1.1, 1.25, 1.5, 2.0 (multiplicative) plus additive
-# delta_ns values. Profiles: smoke (minutes) and full.
+# Paired runs: each (workload, cluster, seed, noise) group runs one healthy
+# twin plus one faulty twin per listed fault variant, all replaying the SAME
+# workload file. That same-trace pairing is what makes a workload-only
+# negative possible: the healthy twin at the same load is the null.
+#
+# Design (see report.md section 16):
+#   primary cluster   2P2D tp=1 Llama-3.1-8B (peers exist, so peer features
+#                     are meaningful; 1P1D is kept as a secondary cluster)
+#   load levels       calibrated, not guessed: rate_sps below comes from
+#                     `run_simulation calibrate --target-u 0.40 / 0.75`
+#   severity          1.25 / 1.5 / 2.0 for compute, bandwidth_fraction
+#                     0.8 / 0.67 / 0.5 for transfer, delay ladder for handoff
+#   benign noise      noise_sigmas on the profile; sigma=0 is bit-identical
+#   bandwidth sweep   link_bw 16 / 50 / 450 GB/s cluster variants
+#
+# Cost note: ~2 min wall per ~40-request run on this host, so the review
+# profile is sized for a few simulated minutes per run at a FIXED
+# utilisation rather than a full day at full volume.
 
 workloads:
   light_poisson: {pattern: poisson, num: 10, rate_sps: 1.0, seed: 11,
@@ -19,21 +30,69 @@ workloads:
               short_in: 64, long_in: 256, short_out: 32, long_out: 128}
   heldout_bursty: {pattern: bursty, num: 24, rate_sps: 6.0, seed: 99, on_s: 0.5, off_s: 3.0,
                    short_in: 64, long_in: 384, short_out: 16, long_out: 192}
+  # Load-matched review workloads. rate_sps is MEASURED, not guessed:
+  # from `run_simulation calibrate` on 2P2D tp=1 Llama-3.1-8B,
+  #   lambda=0.468/s -> U_decode=0.346 (target 0.40, 20 requests)
+  #   lambda=1.621/s -> U_decode=0.723 (target 0.75, 44 requests)
+  # (pilot_2p2d_u40 / pilot_2p2d_u75 in experiments/out). num is sized for
+  # a ~25-35 s run, i.e. 12-17 windows at the 2 s evaluation window.
+  review_u40: {pattern: poisson, num: 20, rate_sps: 0.468, seed: 21,
+               short_in: 32, long_in: 512, short_out: 32, long_out: 256}
+  review_u75: {pattern: poisson, num: 44, rate_sps: 1.621, seed: 22,
+               short_in: 32, long_in: 512, short_out: 32, long_out: 256}
+  # Workload-only negative: same MEAN load, different arrival shape. The
+  # bursty generator alternates on/off, so the mean rate is
+  # rate_sps*on_s/(on_s+off_s); 3.24 with on 2 s / off 2 s gives the same
+  # 1.62 req/s as review_u75 while making the instantaneous rate 2x.
+  review_u75_bursty: {pattern: bursty, num: 44, rate_sps: 3.24, seed: 23,
+                      on_s: 2.0, off_s: 2.0,
+                      short_in: 32, long_in: 512, short_out: 32, long_out: 256}
 
 clusters:
   small_1p1d: configs/cluster/pd_1p1d_small.json
   small_2p2d: configs/cluster/pd_2p2d_small.json
+  bw50_2p2d: configs/cluster/pd_2p2d_bw50.json
+  bw450_2p2d: configs/cluster/pd_2p2d_bw450.json
 
 # Fault templates. target instance ids follow cluster config order
-# (prefill 0..P-1, then decode). kv_transfer_* targets the prefill
-# instance's transfer path (per-pair targeting is not possible).
+# (prefill 0..P-1, then decode); -1 means "last decode instance" and is
+# resolved against the cluster file at run time. kv_transfer_* targets the
+# prefill instance's transfer path.
 fault_templates:
+  decode_mult: {fault_id: decode_slow, target: {role: decode, instance_id: -1},
+                injection_layer: mechanism, mode: compute_multiplicative,
+                factor: 2.0,
+                schedule: {start_s: 4.0, end_s: 300.0, profile: step}}
+  prefill_mult_15x: {fault_id: prefill_slow, target: {role: prefill, instance_id: 0},
+                     injection_layer: mechanism, mode: compute_multiplicative,
+                     factor: 1.5, schedule: {start_s: 4.0, end_s: 300.0, profile: step}}
+  transfer_bw: {fault_id: transfer_bw, target: {role: transfer, instance_id: 0},
+                injection_layer: mechanism, mode: kv_transfer_bandwidth,
+                bandwidth_fraction: 0.5,
+                schedule: {start_s: 4.0, end_s: 300.0, profile: step}}
+  handoff: {fault_id: handoff, target: {role: transfer, instance_id: 0},
+            injection_layer: mechanism, mode: kv_handoff_delay,
+            delay_ns: 100000000,
+            schedule: {start_s: 4.0, end_s: 300.0, profile: step}}
+  # Load-coupled: no injected schedule, onset depends on the workload.
+  # tau_s=8 (not 20): L(t)=u*(1-exp(-t/tau)) must cross th_on=0.55 inside
+  # a 20-25 s run, otherwise the fault never engages and the run is a
+  # silent "neutral". Pinned by test_throttle_template_can_fire_inside_a_review_run.
+  throttle_decode: {fault_id: throttle, target: {role: decode, instance_id: -1},
+                    injection_layer: mechanism, mode: throttle,
+                    slowdown_factor: 1.5, tau_s: 8.0, window_s: 5.0,
+                    th_on: 0.55, th_off: 0.40, m_min: 0.5,
+                    schedule: {start_s: 0.0, end_s: 300.0, profile: step}}
+  # Neutral mechanism: network_degradation on a tp=1 dense trace has no
+  # collective rows, so the audit reports applied=false. Kept as its own
+  # class and excluded from the recall denominator.
+  network_15x: {fault_id: network, target: {role: network, instance_id: all},
+                injection_layer: mechanism, mode: network_degradation,
+                factor: 1.5, schedule: {start_s: 4.0, end_s: 300.0, profile: step}}
+  # Legacy smoke/comparison templates.
   decode_mult_2x: {fault_id: decode_slow, target: {role: decode, instance_id: -1},
                    injection_layer: mechanism, mode: compute_multiplicative,
                    factor: 2.0, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
-  prefill_mult_15x: {fault_id: prefill_slow, target: {role: prefill, instance_id: 0},
-                     injection_layer: mechanism, mode: compute_multiplicative,
-                     factor: 1.5, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
   transfer_bw_half: {fault_id: transfer_bw, target: {role: transfer, instance_id: 0},
                      injection_layer: mechanism, mode: kv_transfer_bandwidth,
                      bandwidth_fraction: 0.5,
@@ -45,9 +104,6 @@ fault_templates:
   decode_stall: {fault_id: stall, target: {role: decode, instance_id: -1},
                  injection_layer: mechanism, mode: worker_stall,
                  schedule: {start_s: 2.0, end_s: 20.0, profile: step}}
-  network_15x: {fault_id: network, target: {role: network, instance_id: all},
-                injection_layer: mechanism, mode: network_degradation,
-                factor: 1.5, schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
   decode_intermittent: {fault_id: decode_intermittent,
                         target: {role: decode, instance_id: -1},
                         injection_layer: mechanism, mode: compute_multiplicative,
@@ -64,15 +120,59 @@ fault_templates:
                     schedule: {start_s: 1.0, end_s: 60.0, profile: step}}
 
 profiles:
+  # Fast check that the pipeline is wired (clocks are recorded in the
+  # frozen smoke bundle: 7667807319 / 8387062877 / 4862442514 /
+  # 8794093936 / 8894547812 ns).
   smoke:
     clusters: [small_1p1d]
+    noise_sigmas: [0.0]
     pairs:
       - {workload: light_poisson, fault: decode_mult_2x}
       - {workload: light_poisson, fault: null}
       - {workload: heavy_poisson, fault: null}
       - {workload: bursty, fault: handoff_100ms}
+
+  # The defensible minimum: one primary cluster, two fault families
+  # (compute-multiplicative and KV-transfer), three severities, two
+  # calibrated load levels, five seeds, plus handoff, throttle and a
+  # neutral-mechanism class. noise_sigmas 0 is the deterministic baseline;
+  # the noise sweep below is separate so it does not multiply every pair.
+  review_min:
+    clusters: [small_2p2d]
+    noise_sigmas: [0.0]
+    pairs:
+      - {workload: review_u40, fault: null}
+      - {workload: review_u40, fault: decode_mult, severity_ladder: [1.25, 1.5, 2.0]}
+      - {workload: review_u40, fault: transfer_bw, severity_ladder: [0.8, 0.67, 0.5]}
+      - {workload: review_u75, fault: null}
+      - {workload: review_u75, fault: decode_mult, severity_ladder: [1.25, 1.5, 2.0]}
+      - {workload: review_u75, fault: transfer_bw, severity_ladder: [0.8, 0.67, 0.5]}
+      - {workload: review_u75, fault: handoff, severity_ladder: [20000000, 50000000, 100000000]}
+      - {workload: review_u75, fault: throttle_decode, severity_ladder: [1.5]}
+      - {workload: review_u75, fault: network_15x}
+      # Workload-only negative at the same load but a bursty arrival shape.
+      - {workload: review_u75_bursty, fault: null}
+
+  # Detectability as a function of benign noise (N2): the same two pairs at
+  # three noise levels. sigma=0 repeats the deterministic baseline.
+  review_noise:
+    clusters: [small_2p2d]
+    noise_sigmas: [0.05, 0.10]
+    pairs:
+      - {workload: review_u75, fault: null}
+      - {workload: review_u75, fault: decode_mult, severity_ladder: [1.25, 1.5]}
+
+  # Detectability as a function of link bandwidth (Q8).
+  review_bandwidth:
+    clusters: [bw50_2p2d, bw450_2p2d]
+    noise_sigmas: [0.0]
+    pairs:
+      - {workload: review_u75, fault: null}
+      - {workload: review_u75, fault: transfer_bw, severity_ladder: [0.5]}
+
   full:
     clusters: [small_1p1d, small_2p2d]
+    noise_sigmas: [0.0]
     pairs:
       - {workload: light_poisson, fault: decode_mult_2x}
       - {workload: light_poisson, fault: null}

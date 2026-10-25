@@ -78,10 +78,10 @@ without changing ASTRA-Sim. We label that `output_approx` only.
 
 | Capability | Status | Where / why |
 |---|---|---|
-| Additive compute slow | NATIVE via extension | `fault_injection.apply_to_trace_rows`, `__main__` hook |
+| Additive compute slow | NATIVE via extension | `fault_study.apply_to_trace_rows`, `__main__` hook |
 | Multiplicative compute slow | NATIVE via extension | same as above |
 | Time-varying profile | NATIVE via extension | `severity_weight` in same file |
-| Transfer bandwidth | NATIVE via extension | `comm_size` inflation on `qkv_proj` |
+| Transfer bandwidth | NATIVE via extension | `comm_size` inflation on `qkv_proj` (measured timing-neutral at tp=1: `report.md` §16.5) |
 | Handoff delay | NATIVE via extension | Router held queue in `__main__` |
 | Worker stall | NATIVE via extension | router skip + schedule guard, non-DP only |
 | Targeting by role+instance | NATIVE via extension | `fault_matches`; per-pair transfer NOT FEASIBLE (see c) |

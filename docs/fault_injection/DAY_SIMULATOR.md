@@ -6,26 +6,28 @@ Build mode; container sim runs pending (Docker daemon down at build time).
 
 ## What was built
 
-- `experiments/fault_detection/day_workload.py`: NHPP arrival generator
-  (morning ramp, configurable Gaussian noon peak, afternoon decay, evening
-  level, optional bursts), seeded, existing JSONL schema. 24h generates in
-  ~0.6s wall on host; SIMULATING a day costs ASTRA-Sim handshakes per
-  batch -- measure with short horizons first.
-- `serving/core/gpu_state.py`: per-GPU synthetic accumulated-load state
-  (`GpuThrottleState`, `ThrottleManager`, `apply_throttle_factor`,
-  config validation/loading). Disabled-by-default; `factor()` is 1.0
-  unless throttled.
+- `experiments/fault_detection/run_simulation.py` (`generate_day_workload`):
+  NHPP arrival generator (morning ramp, configurable Gaussian noon peak,
+  afternoon decay, evening level, optional bursts), seeded, existing JSONL
+  schema. 24h generates in ~0.6s wall on host; SIMULATING a day costs
+  ASTRA-Sim handshakes per batch -- measure with short horizons first.
+- `serving/core/fault_study.py` (`GpuThrottleState`, `ThrottleManager`,
+  `apply_throttle_factor`, `tick_throttle`, `audit_throttle_batch`,
+  config validation/loading): per-GPU synthetic accumulated-load state.
+  Disabled-by-default; `factor()` is 1.0 unless throttled.
 - `serving/__main__.py` wiring: `--throttle-config`,
-  `--throttle-audit-output`, `_throttle_tick`, build-start record, factor
-  hook after the fault hook, completion-window busy accounting,
-  `throttle_audit.jsonl` write-out.
+  `--throttle-audit-output`, per-window `tick_throttle` from the event
+  loop, factor hook after the fault hook, completion-window busy
+  accounting, `throttle_audit.jsonl` write-out.
 - `configs/cluster/moe_pd_tp2_pp2_instance.json`: 1P1D P/D topology on
   Qwen3-30B-A3B, TP=2 PP=2 EP=2 per pool (8 instance-GPUs, 12 NPUs with
   prefill shadow range).
 - `experiments/fault_detection/example_throttle/decode_pool_moe_pd_tp2_pp2.json`:
   decode-pool-only example (GPUs 8-11).
-- Tests: `test_day_workload.py`, `test_gpu_throttle.py`,
-  `test_router_paths.py` (absolute-path regression). 36 passed on host.
+- Tests: `tests/test_run_simulation.py` (day generator, incl. the
+  thinning-bound and one-shot-boundary pins), `tests/test_fault_study.py`
+  (throttle state machine, audit, jitter), `tests/test_router_paths.py`
+  (absolute-path regression). 89 passed on host.
 - Bug fix: `Router.load_requests` now honours absolute dataset paths
   (`os.path.isabs` guard); relative `"../"` behaviour unchanged.
 
@@ -45,7 +47,8 @@ Build mode; container sim runs pending (Docker daemon down at build time).
   size grace by workload horizon, not a separate flag (unimplemented).
 - Ground truth (`throttle_audit.jsonl`: per-window load/busy/throttled/
   factor + per-batch scaled rows) is evaluation-only, never a detector
-  feature. `ml/features.py` untouched.
+  feature. `evaluate.py` reads it as labels only, tagged
+  `fault_id: throttle`, and keeps it out of `FEATURE_COLUMNS`.
 
 ## Model profile and parallelism (verified, not assumed)
 

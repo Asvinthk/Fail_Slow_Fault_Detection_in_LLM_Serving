@@ -1,49 +1,72 @@
 # Fault-detection experiments
 
-Research extension on top of LLMServingSim 2.0. The project **extends**
-the simulator (fault hooks, telemetry, experiment harness) rather than
-replacing its scheduler or network backend, which are upstream code
-and stay byte-identical when no fault option is given.
+Research extension on top of LLMServingSim 2.0. The project **extends** the
+simulator (fault hooks, telemetry, experiment harness) rather than replacing
+its scheduler or network backend, which are upstream code and stay
+byte-identical when no fault option is given.
 
-## Area map
+## Four files, four jobs
 
-- `workloads.py` — seeded Poisson/bursty/sustained JSONL generator.
-- `matrix.yaml` — experiment matrix (`smoke` and `full` profiles).
-- `generate.py` — paired healthy/faulty runner; writes `manifest.jsonl`.
-- `manifest.py` — manifest loader, observable-leak guard, audit check.
-- `ml/features.py` — observable-only window features, healthy-only
-  residuals, peer ratios.
-- `ml/run.py` — fixed-threshold, residual-threshold, and logistic
-  baselines with abstaining localisation stub; one-command report.
-- `smoke/` — frozen reproducibility bundle for the smoke evaluation.
-- `example_faults/` — small committed fault configs for manual runs.
+| File | Job |
+|---|---|
+| `run_simulation.py` | Generate workloads (Poisson / bursty / sustained / NHPP day), measure the regime of a finished run, calibrate `lambda` for a target decode utilisation, read manifests and audits, invoke `python -m serving` once. |
+| `inject_faults.py` | Expand `matrix.yaml` into paired healthy/faulty runs, write fault and throttle configs, keep ground truth in `manifest.jsonl`. |
+| `evaluate.py` | Clean telemetry, build per-(window, instance) features, derive labels from the audit, run transparent baselines (robust threshold / residual / EWMA / CUSUM), localise with abstention, write `metrics.csv`, `windows.csv`, `report.md`. |
+| `matrix.yaml` | All workload, cluster, severity, bandwidth, noise and seed settings. |
 
-## Contribution vs upstream
+The only notebook is `notebooks/train_detector.ipynb`, and it only trains and
+compares learned detectors on an already-validated `windows.csv`.
 
-| Area | Upstream | Our contribution |
-|---|---|---|
-| Fault injection | none | `serving/core/fault_injection.py`: validator, severity profiles, targeting, trace-row scaling, audit entries |
-| Fault-aware routing / stall handling | plain routing + scheduling | `router.py`: stall skip, hold-and-retry of decode transfers; `__main__.py`: schedule guard, held queues, fault wake-ups |
-| Telemetry | per-request CSV only | `--telemetry-output` batch/request CSVs + ITL side file; `com_cycle` in `controller.parse_output`; schedule-time batch snapshots |
-| Experiment generation | workload generators only | `workloads.py` patterns/seeds, `matrix.yaml`, `generate.py` paired runner |
-| Paired healthy/faulty runs | none | shared workload file + `pair_id` per (workload, cluster, seed) |
-| Manifest and leak guard | none | `manifest.py`: schema, loader, observable-column guard, audit-consistency check |
-| ML features | none | `ml/features.py`: windows, healthy-only least-squares residuals, peer ratios, ground-truth column ban |
-| Detection baselines | none | `ml/run.py`: fixed threshold, residual threshold, logistic regression, abstaining localisation stub, CSV+markdown report |
-| Tests | no suite | `tests/test_fault_injection.py`, `tests/test_fault_ml.py` |
-| Documentation | site + README | `docs/fault_injection/` (7 files), `smoke/` bundle, this file |
+## Commands
 
-## Scratch / helper files (not research contributions)
+```bash
+# 1. calibrate load: pick lambda for a target decode utilisation
+python -m experiments.fault_detection.run_simulation calibrate \
+    --cluster configs/cluster/pd_2p2d_small.json --target-u 0.75 \
+    --out experiments/out/pilot_2p2d_u75
 
-- `check_audit.py` — 9-line audit inspector used during debugging.
-- `fix_lines.py` — 9-line CRLF-to-LF converter for container shell scripts.
+# 2. paired matrix (healthy + faulty twins on one trace), 5 seeds
+python -m experiments.fault_detection.inject_faults \
+    --matrix experiments/fault_detection/matrix.yaml \
+    --profile review_min --out experiments/out/review_min --seeds 1,2,3,4,5
+
+# 3. features, labels, baselines, CIs, report
+python -m experiments.fault_detection.evaluate \
+    --data experiments/out/review_min --report experiments/report/review_min
+```
+
+Every run is resumable: `inject_faults` skips pairs whose runs are already
+`ok` in the manifest, and re-running with the same seeds reproduces the same
+traces.
+
+## What a result means
+
+- Numbers come from **synthetic faults in a simulator**. They validate the
+  detection machinery; they are not evidence of real-hardware detection.
+- Every reported number carries its regime (`lambda`, `U_prefill`,
+  `U_decode`, TPOT), its run count, and a confidence interval over runs
+  (Wilson for proportions, bootstrap over runs for P/R/F1/FPR).
+- Labels are derived from the injection audit, per (window, instance), and
+  the same clock (`finish_ns`) buckets features and labels.
+- Downstream / recovering / neutral windows are reported separately and
+  excluded from the detection metric, never counted as false alarms.
+
+## Layout notes
+
+- `smoke/` — frozen reproducibility bundle for the smoke evaluation
+  (5 runs, clocks recorded in its manifest).
+- `example_faults/`, `example_throttle/` — small committed configs for
+  manual runs.
+- Generated data stays gitignored (`experiments/out/`, `experiments/report/`).
 
 ## Honest scope notes
 
-- No MLP, gradient boosting, macro-F1/confusion-matrix, top-1/top-3,
-  per-family-FPR, or mechanism-classification model is implemented.
-- Localisation is a stub that echoes ground truth when confident.
-- The detector uses simulator-visible serving telemetry only; physical
-  hardware counters (GPU power/thermal, SM/GPU utilisation, NIC/RDMA,
-  clocks/throttling) are not exposed through the simulator path.
+- Localisation is per-instance residual ranking with abstention, not a
+  trained classifier; top-1/top-3 are reported with a Wilson interval.
+- The detector uses simulator-visible serving telemetry only. Physical
+  hardware counters (GPU power/thermal, SM utilisation, NIC/RDMA) are not
+  exposed through the simulator path.
 - "Mechanism" means simulator injection mode, never physical root cause.
+- At `--timing-jitter 0` the simulator is deterministic, so healthy
+  residuals have almost no spread; detectability is over-optimistic unless
+  a benign noise level is set. Sweep `--timing-jitter` (0.02/0.05/0.10).

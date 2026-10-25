@@ -1,10 +1,18 @@
 # Design note (prototype, student-readable)
 
+Module map (after consolidation): every custom mechanism lives in
+`serving/core/fault_study.py`. The experiment harness is
+`experiments/fault_detection/{run_simulation,inject_faults,evaluate}.py`
+plus `matrix.yaml`. Earlier module names (`fault_injection.py`,
+`gpu_state.py`, `timing_jitter.py`, `workloads.py`, `generate.py`,
+`manifest.py`, `labels.py`, `regime.py`, `ml/`) are historical; they were
+merged, not removed from behaviour.
+
 ## What each mode does and where it hooks
 
 1. `compute_multiplicative` / `compute_additive`
    Hook: `serving/__main__.py` after `generate_trace`, before
-   `generate_graph`, via `fault_injection.apply_to_trace_rows`.
+   `generate_graph`, via `fault_study.apply_to_trace_rows`.
    Why: the trace rows are the only place profiled latency enters.
    Scaling `comp_time` there changes what ASTRA-Sim executes.
    Integer-rounded because the converter requires int.
@@ -74,6 +82,26 @@
    and 10/10 requests completed. Near-stop fail-slow (factor 10+) is
    provided for crash-vs-fail-slow comparison. Real crash with loss
    is out of scope.
+
+6. `throttle` (synthetic thermal-like, `--throttle-config`)
+   Hook: `fault_study.tick_throttle` per fixed sim-time window, then
+   `apply_throttle_factor` on the targeted instance's future batches.
+   State is a dimensionless workload-history accumulator
+   `L += (u - L)*(1 - exp(-dt/tau))` fed by ACTUAL busy fractions
+   (never queue length, which would be circular), with hysteresis
+   `th_on`/`th_off`. Compute-only: `comm_size` is never touched.
+   Load-coupled by design -- onset depends on the workload, which is
+   what makes it the useful workload-vs-fault discrimination test.
+   Audit: `throttle_audit.jsonl` (per-window state + per-batch
+   application), tagged `fault_id: throttle` when read.
+
+7. `--timing-jitter SIGMA` (benign noise, OFF by default)
+   Hook: `fault_study.apply_timing_jitter` on compute rows only,
+   keyed lognormal with `E[factor] = 1`. `sigma == 0` is a
+   byte-for-byte no-op, so `Total clocks (ns)` stays bit-identical
+   and the regression baselines remain valid. Without it the
+   simulator is a deterministic table lookup, healthy residuals have
+   almost no spread, and detectability is over-optimistic.
 
 ## Timing semantics
 

@@ -2,8 +2,24 @@
 
 Preliminary small-scale end-to-end check of the fault-detection
 pipeline. This is NOT the final benchmark — it exercises the full
-path (generate → simulate → manifest → features → baselines → report)
-on 5 short runs so the machinery, not the science, is what gets tested.
+path (workload → simulate → manifest → features → labels → baselines →
+report) on 5 short runs so the machinery, not the science, is what gets
+tested.
+
+> **Two things in this directory have different standing.**
+>
+> 1. The **five clocks** are the live regression baseline and are still
+>    exact after the consolidation and the instrument repairs
+>    (7667807319 / 8387062877 / 4862442514 / 8794093936 / 8894547812 ns,
+>    re-measured twice: sequential and with 3 parallel workers).
+> 2. The frozen **`metrics.csv` is historical**. It was produced by the
+>    pre-repair instrument, which labelled every window inside the
+>    injection schedule anomalous and whose localiser echoed the ground
+>    truth. Re-running the current `evaluate.py` on this same frozen
+>    `data/` yields 33 windows (8 `root_cause`, 25 `unaffected`, 7
+>    `downstream` excluded) instead of "40 windows, 22 anomalous". Do not
+>    cite the old rows; the current numbers come from `review_min`
+>    (`report.md` §16.5).
 
 ## What it tests
 
@@ -18,35 +34,35 @@ confusion (heavy-but-healthy must not alarm).
 - `light_poisson` (10 reqs, 1/s): healthy + faulty (decode_mult_2x)
 - `heavy_poisson` (24 reqs, 8/s): healthy only
 - `bursty` (24 reqs, on/off): healthy + faulty (handoff_100ms)
-- 5 runs, 0 failed; 40 windows (22 healthy, 18 anomalous) at 2 s windows.
+- 5 runs, 0 failed.
 
 ## Exact command that produced this bundle
 
 From the repo root, inside the sim container:
 
 ```bash
-python -m experiments.fault_detection.generate --matrix experiments/fault_detection/matrix.yaml --profile smoke --out experiments/out/
+python -m experiments.fault_detection.inject_faults \
+  --matrix experiments/fault_detection/matrix.yaml \
+  --profile smoke --out experiments/out/
 ```
 
 Seed: 42 (`--seed 42` default). The live manifest is
 `experiments/out/manifest.jsonl` (gitignored). This directory holds a
 frozen copy laid out exactly as the runner expects: `data/` contains
 `manifest.jsonl` plus one directory per `pair_id` (shared workload,
-per-twin telemetry, audit); `metrics.csv` is the generated report
-output frozen alongside for row-for-row comparison.
+per-twin telemetry, audit); `metrics.csv` is the report output frozen
+alongside for row-for-row comparison (historical, see the note above).
 
-## Regenerate the ML metrics from the frozen data (no simulator needed)
+## Regenerate metrics from the frozen data (no simulator needed)
 
 ```bash
-python -m experiments.fault_detection.ml.run --data experiments/fault_detection/smoke/data --report <empty-dir>/
+python -m experiments.fault_detection.evaluate \
+  --data experiments/fault_detection/smoke/data --report <empty-dir>/
 ```
 
-Requires only Python with numpy (scikit-learn optional; the logistic
-baseline falls back to residual predictions without it). The output
-`metrics.csv` must match the committed `metrics.csv` on every row
-except `inference_ms_per_window`, which is wall-clock timing and
-varies by machine (verified: all scientific rows identical;
-1.318 ms here vs 4.049 ms in the container).
+Requires only Python with numpy. Output: `metrics.csv`, `windows.csv`,
+`report.md`. `inference_ms_per_window` is wall-clock timing and varies by
+machine; every other row is deterministic.
 
 ## Expected outputs and layout
 
@@ -55,26 +71,16 @@ varies by machine (verified: all scientific rows identical;
   `batch_telemetry.csv`, `request_telemetry.csv`, `request_itls.jsonl`
   plus the ground-truth `injection_audit.jsonl` (never fed to features)
 - `manifest.jsonl` — one line per run (clocks, fault detail,
-  `successfully_applied`, expected label, status)
-- `metrics.csv` — detector metrics; `report.md` — verified numbers
-  with raw counts (see below); `architecture.svg` — system diagram
+  `successfully_applied`, expected label, status, regime)
+- `metrics.csv` (historical) — detector metrics; `report.md` — verified
+  numbers with raw counts; `architecture.svg` — system diagram
 
-## Verified result (from `report.md`, counts included)
+## Why this bundle is small
 
-- Fixed threshold: test P 1.000 / R 0.556 / FPR 0.000 (0 false alarms;
-  misses the subtle handoff fault).
-- Residual-only: test P 0.857 / R 0.667 / F1 0.750 / FPR 0.125, i.e.
-  1 false alarm in 8 healthy test windows.
-- Logistic regression: test P 0.286 / R 0.222 — preliminary negative;
-  insufficient data is a possible explanation, not a proven diagnosis.
-- The sample (40 windows) is consistent with workload-normalised
-  residuals helping separate faults from workload variation, but too
-  small to establish superiority. No general "residuals are better"
-  claim is made.
-- Localisation in this bundle is a STUB that echoes ground truth when
-  confident (`ml/run.py`); its 0.475 figure is not a model result.
-  No MLP, gradient boosting, macro-F1, confusion-matrix, top-1/top-3,
-  per-family-FPR, or mechanism-classification model is implemented.
+40 windows cannot separate "residuals help" from "this dataset is easy".
+Its job is to prove the pipeline runs end to end and that the simulator
+still produces the exact clocks it produced before. The scientific
+measurement is the calibrated `review_min` matrix.
 
 ## Hardware counters
 

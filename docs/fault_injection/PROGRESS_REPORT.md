@@ -1,6 +1,19 @@
 # Two-Month Project: Progress Report
 ## Fail-slow fault detection for PD-disaggregated LLM serving (simulation-based)
 
+> **Status note (superseded in part).** This document records the state at the
+> end of the first build. The instrument described in sections that reference
+> `ml/features.py`, `ml/run.py`, `fault_injection.py`, `gpu_state.py`,
+> `workloads.py`, `generate.py`, `manifest.py`, `labels.py` or `regime.py` has
+> since been consolidated into `serving/core/fault_study.py` +
+> `experiments/fault_detection/{run_simulation,inject_faults,evaluate}.py`, and
+> several measurement defects were fixed (per-(window, instance) audit labels,
+> finish-time bucketing, LOO peer features, run-level CIs, load-calibrated
+> matrix). Where the two disagree, `report.md` §16 and
+> `docs/fault_injection/RUNLOG.md` are authoritative. Localisation is no longer
+> a stub that echoes ground truth: it ranks per-instance residuals and
+> abstains. Numbers in this file that predate the fixes are historical.
+
 Status legend: DONE = completed, DOING = ongoing, TODO = pending.
 This is a prototype for learning, not a production detector.
 Synthetic faults cannot prove real-hardware detection.
