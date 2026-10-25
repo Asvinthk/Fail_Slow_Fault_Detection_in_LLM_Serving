@@ -10,6 +10,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -196,6 +197,12 @@ def _batch(inst, report_id, finish_s, dur_ns=10_000_000, sys_id=None):
         int((finish_s - 0.1) * 1e9), int(finish_s * 1e9), dur_ns)
 
 
+def _reqs(count=3):
+    """Request rows naming instance 0 as prefill and 1 as decode."""
+    return ["0,0,1,10,20,10,0,0,0,0,0,1000,1000000000,0,1,0,1,1,1,1\n"
+            for _ in range(count)]
+
+
 ENTRY = {
     "fault_present": True,
     "successfully_applied": True,
@@ -228,6 +235,20 @@ def test_label_depends_on_instance_and_uses_audit(tmp_path):
     # downstream victim, never a positive and never a false-positive
     # candidate.
     assert prefill["kind"] == KIND_DOWNSTREAM
+
+
+def test_role_wide_target_does_not_crash_labelling(tmp_path):
+    """`instance_id: all` is not localisable but must still label."""
+    d = _write_batch(tmp_path, [_batch(1, 1, 1.0)],
+                     audit=[{"fault_id": "network", "instance": 1,
+                             "batch_id": 0, "applied": True,
+                             "time_ns": 1_000_000_000}])
+    entry = {"fault_present": True, "faults": [{
+        "fault_id": "network", "mode": "network_degradation",
+        "target": {"role": "network", "instance_id": "all"},
+        "schedule": {"start_s": 0.0, "end_s": 2.0}}]}
+    labels = label_windows(d, entry, window_s=2.0)
+    assert labels[(2.0, 1)]["kind"] == KIND_ROOT
 
 
 def test_windows_after_fault_are_recovering_not_healthy(tmp_path):
@@ -319,6 +340,42 @@ def _collect(root):
     return evaluate.collect_dataset(str(root), window_s=2.0,
                                     applied_share=evaluate.DEFAULT_APPLIED_SHARE,
                                     recovery_s=evaluate.DEFAULT_RECOVERY_S)
+
+
+def test_windows_dump_contains_the_excluded_kinds(tmp_path):
+    """The dump is the audit trail for the exclusions, so it must hold them.
+
+    `report.md` says "excluded: downstream N, neutral M"; if windows.csv
+    contained only the scored rows, a reader could not check a single one of
+    those exclusions. The metric is still computed on the eligible subset.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+    healthy = root / "pair_1" / "healthy_telemetry"
+    healthy.mkdir(parents=True)
+    _write_batch(healthy, [_batch(0, 1, 1.0), _batch(1, 1, 1.0)])
+    # Fault on decode instance 1 only, so instance 0's window is downstream.
+    faulty = root / "pair_1" / "faulty0_telemetry"
+    faulty.mkdir()
+    _write_batch(faulty, [_batch(0, 1, 1.0), _batch(1, 1, 1.0)],
+                 audit=[{"fault_id": "f0", "instance": 1, "batch_id": 0,
+                         "applied": True, "time_ns": 1_000_000_000}])
+    with open(root / "manifest.jsonl", "w") as f:
+        f.write(_manifest_entry(run_id="h", fault_present=False, faults=[],
+                                telemetry_dir="healthy_telemetry"))
+        f.write(_manifest_entry(run_id="f0", telemetry_dir="faulty0_telemetry"))
+
+    out = tmp_path / "report"
+    assert evaluate.main(["--data", str(root), "--report", str(out),
+                          "--no-bootstrap"]) == 0
+
+    import csv
+    with open(out / "windows.csv") as fh:
+        kinds = [r["label_kind"] for r in csv.DictReader(fh)]
+    assert KIND_DOWNSTREAM in kinds, kinds
+    assert KIND_ROOT in kinds, kinds
+    header = (out / "report.md").read_text()
+    assert "Excluded from the metric, counted over all" in header
 
 
 def test_multi_variant_pair_resolves_each_telemetry_dir(tmp_path):
@@ -461,6 +518,70 @@ def test_dose_response_keeps_a_family_scoreable(tmp_path):
     assert kinds["f1"] == KIND_ROOT
 
 
+def test_detection_delay_reads_the_variant_telemetry_dir(tmp_path):
+    """The delay path had its own hardcoded `faulty_telemetry` lookup.
+
+    With that bug every faulty run of a multi-variant pair was invisible
+    to the delay measurement, which then reported "0 runs with an alarm"
+    while the same runs were being detected in the window metrics.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+    healthy = root / "pair_1" / "healthy_telemetry"
+    healthy.mkdir(parents=True)
+    _write_batch(healthy, [_batch(1, i + 1, 1.0 + i * 0.2, dur_ns=10_000_000)
+                           for i in range(6)], requests=_reqs())
+    faulty = root / "pair_1" / "faulty0_telemetry"
+    faulty.mkdir()
+    _write_batch(faulty, [_batch(1, i + 1, 2.0 + i * 0.2, dur_ns=100_000_000)
+                          for i in range(6)], requests=_reqs(),
+                 audit=[{"fault_id": "f0", "instance": 1, "batch_id": 0,
+                         "applied": True, "time_ns": 1_000_000_000}])
+    with open(root / "manifest.jsonl", "w") as f:
+        f.write(_manifest_entry(run_id="h", fault_present=False, faults=[],
+                                total_clocks_ns=1000,
+                                telemetry_dir="healthy_telemetry"))
+        f.write(_manifest_entry(run_id="f0", total_clocks_ns=9000,
+                                telemetry_dir="faulty0_telemetry"))
+
+    data = _collect(root)
+    delay = evaluate.detection_delay(data, str(root), {"decode": 1_000_000.0})
+    assert delay["n_runs"] == 1
+    assert delay["details"][0]["run_id"] == "f0"
+
+
+def test_delay_does_not_alarm_when_the_fault_was_never_applied(tmp_path):
+    """A threshold that fires on a no-effect run measures the threshold.
+
+    In review_min the delay path compared every instance against
+    `min(thresholds)`, i.e. the decode window threshold applied to prefill
+    batches, so all 85 faulty runs "detected" within ~1.2 s -- including the
+    5 `network` runs whose audit records applied=false and the 30
+    timing-neutral `transfer_bw` runs. The statistic is now calibrated on
+    healthy runs at the same granularity, so a run whose telemetry equals
+    healthy must not alarm.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+    for name in ("healthy_telemetry", "faulty0_telemetry"):
+        d = root / "pair_1" / name
+        d.mkdir(parents=True)
+        _write_batch(d, [_batch(1, i + 1, 1.0 + i * 0.2, dur_ns=10_000_000)
+                         for i in range(6)], requests=_reqs())
+    with open(root / "manifest.jsonl", "w") as f:
+        f.write(_manifest_entry(run_id="h", fault_present=False, faults=[],
+                                total_clocks_ns=1000,
+                                telemetry_dir="healthy_telemetry"))
+        f.write(_manifest_entry(run_id="f0", total_clocks_ns=1000,
+                                telemetry_dir="faulty0_telemetry"))
+
+    data = _collect(root)
+    thresholds = evaluate.ewma_thresholds(data, str(root))
+    assert thresholds, "healthy runs must yield a calibration"
+    delay = evaluate.detection_delay(data, str(root), thresholds)
+    assert delay["n_runs"] == 0, delay["details"]
+
+
 def test_missing_telemetry_dir_is_reported_not_silently_dropped(tmp_path):
     """A run that cannot be read must be visible in the report."""
     root = tmp_path / "data"
@@ -474,6 +595,40 @@ def test_missing_telemetry_dir_is_reported_not_silently_dropped(tmp_path):
     data = _collect(root)
     assert data["rows"] == []
     assert data["skipped_runs"] == ["f0"]
+
+
+def test_fault_config_artifact_is_not_a_feature():
+    """A fault-config run is identifiable from TTFT before the fault acts.
+
+    Every faulty twin of review_u75_small_2p2d_1 has median pre-onset TTFT
+    21.62 ms against the healthy twin's 17.63 ms, including the
+    timing-neutral transfer_bw twins. A model given TTFT/queue features
+    could separate faulty from healthy twins with no fault active, so
+    neither may enter a feature vector.
+    """
+    assert "req_ttft_mean" not in evaluate.FEATURE_COLUMNS
+    assert "req_queue_mean" not in evaluate.FEATURE_COLUMNS
+    # The clean request-level features stay available.
+    assert "req_prefill_svc_mean" in evaluate.FEATURE_COLUMNS
+    assert "req_tpot_mean" in evaluate.FEATURE_COLUMNS
+
+
+def test_workload_fpr_separates_skew_from_healthy():
+    """The bursty negative must be its own row, not pooled away."""
+    rows = []
+    for workload, kind, n in (("u75", KIND_UNAFFECTED, 4),
+                              ("u75_bursty", KIND_UNAFFECTED, 2),
+                              ("u75", KIND_ROOT, 2)):
+        for _ in range(n):
+            rows.append({"workload_id": workload, "label_kind": kind})
+    # Alarm on every bursty window and on nothing else.
+    pred = np.array([0, 0, 0, 0, 1, 1, 0, 0])
+    out = evaluate.workload_fpr(rows, [("det", pred)])
+    by = {r["workload"]: r for r in out}
+    assert by["u75"]["windows"] == 4          # root-cause rows excluded
+    assert by["u75"]["fpr"] == 0.0
+    assert by["u75_bursty"]["fpr"] == 1.0
+    assert by["u75_bursty"]["ci"][1] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +664,43 @@ def test_cusum_accumulates_small_persistent_shift():
     pred = evaluate.cusum_predict(rows, "dur_residual", params)
     assert pred[:10].sum() == 0
     assert pred[10:].sum() >= 1
+
+
+def test_link_label_is_never_a_localisation_hit():
+    """A link label shares no id space with NPU instances.
+
+    `kv-transfer-network:0` names a transfer link; the prefill instance also
+    has id 0. Comparing the two counted 63 of 177 handoff windows as correct
+    localisations and reported top-1 0.831 instead of 1.000.
+    """
+    rows = [
+        {"run_id": "r", "window_end_s": 2.0, "instance_id": 0, "role": "prefill",
+         "dur_residual": 900.0, "label_kind": KIND_DOWNSTREAM,
+         "label": "downstream:0", "label_component": "downstream",
+         "label_instance_id": 0},
+        {"run_id": "r", "window_end_s": 2.0, "instance_id": 0, "role": "prefill",
+         "dur_residual": 900.0, "label_kind": KIND_ROOT,
+         "label": "kv-transfer-network:0",
+         "label_component": "kv-transfer-network", "label_instance_id": 0},
+    ]
+    loc = evaluate.localisation(rows, {"prefill": 100.0})
+    assert loc["scored"] == 0          # nothing scoreable, so no free hit
+    assert loc["top1"] == 0.0
+    assert loc["link_positives"] == 1
+    assert loc["link_windows"] == 1
+
+
+def test_npu_label_is_still_scored_after_the_link_split():
+    rows = []
+    for inst, residual in ((0, 1.0), (1, 500.0)):
+        rows.append({"run_id": "r", "window_end_s": 2.0, "instance_id": inst,
+                     "role": "decode", "dur_residual": residual,
+                     "label_kind": KIND_ROOT if inst == 1 else KIND_DOWNSTREAM,
+                     "label": "decode:1", "label_component": "decode",
+                     "label_instance_id": 1})
+    loc = evaluate.localisation(rows, {"decode": 100.0})
+    assert loc["scored"] == 1 and loc["top1"] == 1.0
+    assert loc["link_positives"] == 0
 
 
 def test_localisation_scores_root_cause_instance_only():

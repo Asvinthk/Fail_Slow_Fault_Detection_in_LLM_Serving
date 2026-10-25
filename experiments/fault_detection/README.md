@@ -50,6 +50,14 @@ traces.
   the same clock (`finish_ns`) buckets features and labels.
 - Downstream / recovering / neutral windows are reported separately and
   excluded from the detection metric, never counted as false alarms.
+- A fault family whose severities produce bit-identical total clocks is
+  **timing-neutral**: the trace changed, the simulation did not. Those
+  windows are excluded as `neutral` and the family is named in
+  `report.md`, because scoring them would count a guaranteed miss against
+  every detector. `kv_transfer_bandwidth` is such a family at tp=1.
+- A run whose telemetry directory cannot be found is reported
+  (`n_runs_missing_telemetry`), never silently dropped and never treated
+  as healthy.
 
 ## Layout notes
 
@@ -58,11 +66,21 @@ traces.
 - `example_faults/`, `example_throttle/` — small committed configs for
   manual runs.
 - Generated data stays gitignored (`experiments/out/`, `experiments/report/`).
+- The manifest records each run's `telemetry_dir`, so a pair with several
+  fault variants (`faulty0_telemetry`, `faulty1_telemetry`, ...) is read
+  correctly instead of being derived from `fault_present`.
 
 ## Honest scope notes
 
 - Localisation is per-instance residual ranking with abstention, not a
   trained classifier; top-1/top-3 are reported with a Wilson interval.
+  The candidate set is NPU instances, so a transfer-link label
+  (`kv-transfer-network:0`) is reported as `localization_not_localisable`
+  rather than scored -- its id shares no space with NPU ids.
+- `mean_detection_delay_s` is an upper bound, not a detection latency: the
+  generated report carries a per-family table showing which families
+  alarmed while their audit says nothing was applied or their clocks were
+  bit-identical, and says so explicitly next to the number.
 - The detector uses simulator-visible serving telemetry only. Physical
   hardware counters (GPU power/thermal, SM utilisation, NIC/RDMA) are not
   exposed through the simulator path.

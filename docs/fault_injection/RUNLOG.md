@@ -673,3 +673,145 @@ neutrality. Pinned by
 `test_timing_neutral_mechanism_is_excluded_not_scored`,
 `test_dose_response_keeps_a_family_scoreable` and
 `test_fault_that_moves_clocks_stays_a_positive`.
+
+### 11. Regression after the two fixes
+
+Host suite and the frozen smoke bundle were re-run after items 9 and 10:
+
+```
+python -m pytest tests\ -q
+99 passed in 15.81s
+
+python -m experiments.fault_detection.evaluate \
+  --data experiments/fault_detection/smoke/data --report %TEMP%\smoke_recheck
+-> wrote metrics.csv, report.md and windows.csv (33 windows)
+```
+
+`n_windows=33`, `n_root_cause=8`, `n_unaffected=25`,
+`n_excluded_downstream=7`, `n_runs_missing_telemetry=0`,
+`n_timing_neutral_families=0`, `localization_top1=0.875` -- identical to
+the post-repair numbers in item 3, so neither fix changed the frozen
+bundle. `n_timing_neutral_families=0` is the right answer there: the
+smoke twins have different clocks from each other and from healthy, so
+no family is neutral.
+
+### 12. The calibrated matrix completed (100 runs, 0 failed)
+
+```
+python -u -m experiments.fault_detection.inject_faults \
+  --matrix experiments/fault_detection/matrix.yaml \
+  --profile review_min --out experiments/out/review_min \
+  --seeds 1,2,3,4,5 --workers 3
+...
+done, 0 failed run(s)
+```
+
+100 manifest lines: 15 healthy twins + 85 faulty twins (5 seeds x
+(u40 7 twins + u75 11 twins + bursty 1 twin)). Wall clock ~85 min at 3
+workers, i.e. ~1.1 runs/min, I/O bound on the Windows bind mount. The
+evaluation that produced `report.md` §16.5:
+
+```
+python -m experiments.fault_detection.evaluate \
+  --data experiments/out/review_min --report experiments/report/review_min
+-> wrote metrics.csv, report.md and windows.csv (2542 windows)
+
+n_windows=2542  n_root_cause=676  n_unaffected=1866
+n_excluded_downstream=2379  n_excluded_recovering=1  n_excluded_neutral=554
+n_runs_missing_telemetry=0  n_runs_missing_audit=0
+```
+
+### 13. Three defects found by auditing the report against its own dump
+
+All three were silent: the report looked self-consistent, and only
+reading the dump against the prose exposed them.
+
+(a) **`windows.csv` held only the scored rows.** The header reported
+"excluded: downstream 2379, neutral 554" while the dump contained zero
+rows of either kind, so no exclusion could be checked and 554 looked like
+it was one family. The dump now writes every row: `unaffected` 1866,
+`downstream` 2379, `root_cause` 676, `neutral` 554, `recovering` 1 =
+5476, with metrics still computed on the 2542 scored rows. Reading it
+also corrected the prose: the 554 are 254 from the `network` twin (audit
+`applied=false`) plus 300 from the timing-neutral `transfer_bw` twins.
+Pinned by `test_windows_dump_contains_the_excluded_kinds`.
+
+(b) **Localisation compared a link label with NPU instance ids.**
+`kv-transfer-network:0` names a transfer link; NPU instance 0 is the
+prefill. Every handoff window whose top-ranked instance happened to be 0
+was scored as a correct localisation: 63 of 177. Reported top-1 0.831
+instead of 1.000 over the 499 NPU-labelled positives; the 177 link
+positives are now reported as `localization_not_localisable`, because a
+link is not in the candidate set. Pinned by
+`test_link_label_is_never_a_localisation_hit` and
+`test_npu_label_is_still_scored_after_the_link_split`.
+
+(c) **The delay path applied `min(thresholds)` to every role.** The
+decode window threshold is 13,650 ns; prefill healthy residuals are
+~4.0M ns. Prefill crossed the decode threshold in every run, so all 85
+faulty runs "alarmed" (mean 0.82 s) -- including the 5 `network` runs
+whose audit says `applied=false` and the 30 timing-neutral `transfer_bw`
+runs. The statistic is now calibrated on healthy runs at its own
+granularity: 73 of 85 alarm, `decode_slow` 30/30 (mean 1.60 s),
+`throttle` 5/5 (mean 8.50 s, consistent with `tau_s=8`), but also
+handoff 10/15, `network` 4/5, `transfer_bw` 24/30. So the delay number is
+an upper bound and the latency axis is not established (report §16.7 item
+13). Pinned by
+`test_delay_does_not_alarm_when_the_fault_was_never_applied`.
+
+Host suite after the three fixes: `107 passed in 3.34s`.
+
+### 14. Honest negatives from the matrix, with exact clocks
+
+- **`kv_transfer_bandwidth` is timing-neutral.** In
+  `review_u40_small_2p2d_1`, severities 0.8 / 0.67 / 0.5 all give
+  `43043305415` ns, while the audit records comm size x1.25 / x1.5 / x2.0.
+  The trace changed and the simulation did not.
+- **Handoff is negligible and non-monotonic.** Same pair, healthy
+  `26551433758` ns: 20 ms -> +10,816,476 ns (+0.041%), 50 ms ->
+  +7,013,835 ns (+0.026%), 100 ms -> +11,143,874 ns (+0.042%); median
+  decode batch duration 11.29 -> 11.32 ms. A 50 ms hold moves the clock
+  less than a 20 ms hold.
+- **The `network` twin injected nothing.** 5 of 5 runs carry
+  `successfully_applied=false` with the manifest reason "audit
+  inconsistency: records for network are inside the window but
+  applied=false"; their clocks equal the timing-neutral `transfer_bw`
+  twins exactly (`26552880486` ns). 254 neutral + 37 unaffected windows,
+  no positives: an unexercised cell, not a negative result.
+- **Smoke bundle after the localisation fix:** 33 windows (8
+  `root_cause`, 25 `unaffected`, 7 `downstream` excluded),
+  `localization_top1=1.000` over 5 NPU positives with 3 link positives
+  reported as not localisable. The 0.875 in items 3 and 11 was the same
+  link-label comparison defect, not a change in the data.
+
+### 15. Final verification pass after the three fixes
+
+Re-ran the whole instrument on the committed matrix, then the suite:
+
+```
+python -m experiments.fault_detection.evaluate \
+  --data experiments/out/review_min --report experiments/report/review_min
+-> wrote metrics.csv, report.md and windows.csv (2542 windows)
+
+dump kinds: {'unaffected': 1866, 'downstream': 2379, 'root_cause': 676,
+             'neutral': 554, 'recovering': 1} total 5476
+localization_top1=1.000 [0.992, 1.000]  top3=1.000
+localization_windows=499  localization_scored_positives=499
+localization_not_localisable=177  localization_link_windows=177
+localization_coverage=1.000  localization_selective_top1=1.000
+mean_detection_delay_s=7.990  delay_runs_detected=73
+
+python -m pytest tests\ -q
+107 passed in 3.19s
+```
+
+The delay block in the generated report now carries a per-family table
+(faulty runs, audit-applied runs, timing-neutral runs, runs with an alarm,
+mean delay) plus the sentence that a crossing is not attributable to the
+fault, naming the seven families whose crossings are unexplained. That is
+what makes the `mean_detection_delay_s` number non-quotable as a detection
+latency without the reader having to reconstruct the table.
+
+Smoke bundle re-checked with the same code: 33 windows, 8 `root_cause`,
+25 `unaffected`, 7 `downstream`, `localization_top1=1.000` over 5 NPU
+positives, 3 link positives reported as not localisable.

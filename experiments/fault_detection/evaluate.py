@@ -372,8 +372,18 @@ FEATURE_COLUMNS = [
     "total_len_mean", "num_prefill_mean", "n_decode_mean", "kv_len_mean",
     "dur_residual", "com_residual",
     "dur_peer_ratio", "wait_peer_ratio", "has_peer",
-    "req_count", "req_ttft_mean", "req_tpot_mean", "req_itl_p99_mean",
-    "req_queue_mean", "req_prefill_svc_mean",
+    "req_count", "req_tpot_mean", "req_itl_p99_mean",
+    "req_prefill_svc_mean",
+    # `req_ttft_mean` and `req_queue_mean` are deliberately NOT features.
+    # A run launched with a fault config schedules arriving requests
+    # ~3.4-4.0 ms later than its healthy twin even when the fault is
+    # inactive: in review_u75_small_2p2d_1 every faulty twin has median
+    # TTFT 21.62 ms before the 4 s onset against the healthy twin's
+    # 17.63 ms, and the timing-neutral transfer_bw twins show the same
+    # offset (18.35 vs 14.97 ms). That is a run-level artifact, not a
+    # fault signal, and a model given it could separate faulty from
+    # healthy twins without any fault being active. Both columns stay in
+    # windows.csv for inspection; neither enters a feature vector.
 ]
 
 
@@ -424,12 +434,23 @@ def _window_key(window_end_s, instance_id):
 
 
 def _fault_targets(entry):
-    """fault_id -> (component, instance_id) for one manifest entry."""
+    """fault_id -> (component, instance_id) for one manifest entry.
+
+    A fault can be aimed at every instance of a role (`instance_id: all`,
+    used by the neutral `network_degradation` template). That is not a
+    localisable target, so it maps to `None` and the label falls back to
+    "unknown:<instance>" from the audit rather than crashing the whole
+    evaluation.
+    """
     targets = {}
     for fault in entry.get("faults", []):
         component = expected_label_for_fault(fault)
         instance = fault.get("target", {}).get("instance_id", -1)
-        targets[fault.get("fault_id")] = (component, int(instance))
+        try:
+            instance = int(instance)
+        except (TypeError, ValueError):
+            instance = None
+        targets[fault.get("fault_id")] = (component, instance)
     return targets
 
 
@@ -722,6 +743,15 @@ def collect_dataset(data_root, window_s, applied_share, recovery_s):
     rows = []
     missing_audit = []
     skipped = []
+    run_family = {}
+    for entry in manifest:
+        if entry.get("fault_present") and entry.get("faults"):
+            fault = entry["faults"][0]
+            severity = (fault.get("factor") or fault.get("bandwidth_fraction")
+                        or fault.get("delay_ns") or fault.get("slowdown_factor")
+                        or fault.get("delta_ns") or "-")
+            run_family[entry["run_id"]] = (fault.get("fault_id", "unknown"),
+                                           str(severity))
     for entry in manifest:
         telemetry_dir = _telemetry_dir(data_root, entry)
         if not os.path.exists(os.path.join(telemetry_dir, "batch_telemetry.csv")):
@@ -782,6 +812,7 @@ def collect_dataset(data_root, window_s, applied_share, recovery_s):
         "missing_audit": missing_audit,
         "skipped_runs": skipped,
         "timing_neutral_faults": ["%s/%s" % key for key in neutral_families],
+        "run_family": run_family,
     }
 
 
@@ -868,28 +899,60 @@ def cusum_params(train_rows, key):
 # ===========================================================================
 # 8. localisation
 # ===========================================================================
+NPU_COMPONENTS = ("prefill", "decode")
+
+
+def _label_component(row):
+    """The component a label names: `decode`, `prefill`, or a link name.
+
+    `label_component` is set by `attach_labels`; the label prefix is the
+    fallback. A row with neither still describes an NPU instance, so the
+    role stands in -- an absent component must never be read as a link.
+    """
+    comp = row.get("label_component")
+    if comp:
+        return comp
+    label = str(row.get("label", ""))
+    if ":" in label:
+        return label.rpartition(":")[0]
+    return row.get("role", "")
+
+
 def localisation(all_rows, thresholds, key="dur_residual"):
     """Rank instances by residual inside each window; score top-1/top-3.
 
-    Only root_cause windows are scored. The candidate set is EVERY instance
-    present in that window (including healthy ones and downstream victims),
-    which is the realistic task: the localiser does not know how many
-    faults exist. Abstention is allowed when no instance exceeds its
-    role's healthy-calibrated threshold.
+    Only root_cause windows whose label names an NPU are scoreable. The
+    candidate set is NPU instances, so a transfer-link label
+    (`kv-transfer-network:0`) can never be a hit: counting it as one when
+    its instance id happens to equal an NPU id is not a localisation, it is
+    a coincidence. That defect reported top-1 0.831 instead of 1.000 --
+    63 of 177 handoff windows were "correct" only because the link label
+    says 0 and the prefill instance is 0. Link positives are counted
+    separately as `not_localisable`, because this localiser has no link in
+    its candidate set.
+
+    Abstention is allowed when no instance exceeds its role's
+    healthy-calibrated threshold.
     """
     by_window = {}
     for r in all_rows:
         by_window.setdefault((r["run_id"], r["window_end_s"]), []).append(r)
     top1 = top3 = scored = abstained = sel_correct = sel_total = 0
-    n_windows = 0
+    n_windows = link_windows = link_positives = 0
     for (_run, _end), items in by_window.items():
         positives = [r for r in items if r["label_kind"] in POSITIVE_KINDS]
         if not positives:
             continue
+        npu = [t for t in positives if _label_component(t) in NPU_COMPONENTS]
+        link = [t for t in positives if _label_component(t) not in NPU_COMPONENTS]
+        link_positives += len(link)
+        if not npu:
+            link_windows += 1
+            continue
         n_windows += 1
         ranked = sorted(items, key=lambda r: r[key], reverse=True)
         best = ranked[0]
-        for true in positives:
+        for true in npu:
             scored += 1
             if best["instance_id"] == true["label_instance_id"]:
                 top1 += 1
@@ -898,7 +961,7 @@ def localisation(all_rows, thresholds, key="dur_residual"):
         if best[key] <= thresholds.get(best["role"], float("inf")):
             abstained += 1
             continue
-        for true in positives:
+        for true in npu:
             sel_total += 1
             if best["instance_id"] == true["label_instance_id"]:
                 sel_correct += 1
@@ -911,6 +974,8 @@ def localisation(all_rows, thresholds, key="dur_residual"):
         "abstained_windows": abstained,
         "coverage": 1.0 - abstained / float(n_windows) if n_windows else 0.0,
         "selective_top1": sel_correct / float(sel_total) if sel_total else 0.0,
+        "link_windows": link_windows,
+        "link_positives": link_positives,
     }
 
 
@@ -938,16 +1003,81 @@ def batch_residuals(telemetry_dir, model):
     return out
 
 
-def detection_delay(dataset, data_root, thresholds):
-    """First EWMA crossing after onset, at 0.5 s stride.
+def ewma_steps(telemetry_dir, model, stride=DELAY_STRIDE_S):
+    """`[(t, {instance_id: ewma_residual})]` at `stride` steps of the run.
+
+    The statistic the delay measurement scores. Kept in one place so the
+    threshold and the alarm use the same quantity.
+    """
+    batches = batch_residuals(telemetry_dir, model)
+    if not batches:
+        return []
+    horizon = batches[-1]["finish_ns"] / 1e9
+    ewma = {}
+    idx = 0
+    steps = []
+    t = 0.0
+    while t <= horizon + 1e-9:
+        limit = t * 1e9
+        while idx < len(batches) and batches[idx]["finish_ns"] <= limit:
+            b = batches[idx]
+            prev = ewma.get(b["instance_id"])
+            ewma[b["instance_id"]] = (b["residual"] if prev is None
+                                      else EWMA_ALPHA * b["residual"]
+                                      + (1.0 - EWMA_ALPHA) * prev)
+            idx += 1
+        steps.append((t, dict(ewma)))
+        t += stride
+    return steps
+
+
+def ewma_thresholds(dataset, data_root, k=MAD_K):
+    """Per-role alarm threshold for the batch-EWMA delay detector.
+
+    Calibrated on HEALTHY runs with the statistic that is actually scored.
+    A threshold calibrated on 2 s *window means* is far too tight for a
+    per-batch EWMA: with the window threshold, 3 of 5 handoff runs alarmed
+    although the audit shows nothing was applied, and every run "detected"
+    within 1.2 s -- a threshold artefact reported as detection latency.
+    """
+    model = dataset["model"]
+    per_role = {}
+    for entry in dataset["manifest"].values():
+        if entry.get("fault_present"):
+            continue
+        telemetry_dir = _telemetry_dir(data_root, entry)
+        roles = infer_instance_roles(telemetry_dir)
+        for _t, state in ewma_steps(telemetry_dir, model):
+            for inst, value in state.items():
+                role = roles.get(inst)
+                if role:
+                    per_role.setdefault(role, []).append(value)
+    return {role: mad_threshold(values, k)
+            for role, values in per_role.items() if values}
+
+
+def detection_delay(dataset, data_root, thresholds=None):
+    """First per-role EWMA crossing after onset, at 0.5 s stride.
+
+    Each instance is compared against ITS OWN role threshold, and that
+    threshold is calibrated on healthy runs at the same statistic
+    (`ewma_thresholds`). The earlier version compared every instance against
+    `min(thresholds)` of the *window* thresholds, i.e. the decode threshold
+    (~14 us) applied to prefill batches whose healthy residual scale is
+    ~4 ms: prefill crossed it in every run, so all 85 faulty runs
+    "alarmed", including runs whose audit says nothing was applied.
 
     Delay is reported in simulated seconds AND in requests completed
     between onset and the alarm, because a window-granular delay is an
     artefact of the window length.
     """
     model = dataset["model"]
+    if thresholds is None:
+        thresholds = ewma_thresholds(dataset, data_root)
     results = []
-    limit_thresh = min(thresholds.values()) if thresholds else float("inf")
+    n_faulty = 0
+    by_family = {}
+    neutral = set(dataset.get("timing_neutral_faults", []))
     for run_id, entry in dataset["manifest"].items():
         if not entry.get("fault_present"):
             continue
@@ -956,54 +1086,119 @@ def detection_delay(dataset, data_root, thresholds):
         if not starts:
             continue
         onset = min(starts)
-        run_dir = os.path.join(data_root, entry["pair_id"])
-        telemetry_dir = os.path.join(run_dir, "faulty_telemetry")
+        telemetry_dir = _telemetry_dir(data_root, entry)
         batches = batch_residuals(telemetry_dir, model)
         if not batches:
             continue
+        roles = infer_instance_roles(telemetry_dir)
+        steps = ewma_steps(telemetry_dir, model)
         req_path = os.path.join(telemetry_dir, "request_telemetry.csv")
         ends = []
         if os.path.exists(req_path):
             for r in read_csv_rows(req_path):
                 ends.append(_as_float(r, "arrival_ns") + _as_float(r, "latency_ns"))
         ends.sort()
-        horizon = batches[-1]["finish_ns"] / 1e9
-        ewma = {}
-        idx = 0
         alarm_s = None
         alarm_requests = 0
-        t = 0.0
-        while t <= horizon + 1e-9:
+        for t, ewma in steps:
             limit = t * 1e9
-            while idx < len(batches) and batches[idx]["finish_ns"] <= limit:
-                b = batches[idx]
-                prev = ewma.get(b["instance_id"])
-                ewma[b["instance_id"]] = (b["residual"] if prev is None
-                                          else EWMA_ALPHA * b["residual"]
-                                          + (1.0 - EWMA_ALPHA) * prev)
-                idx += 1
             if t >= onset and alarm_s is None:
-                for value in ewma.values():
-                    if value > limit_thresh:
+                for inst, value in ewma.items():
+                    thr = thresholds.get(roles.get(inst, ""))
+                    if thr is not None and value > thr:
                         alarm_s = t
                         alarm_requests = sum(1 for e in ends
                                              if onset * 1e9 < e <= limit)
                         break
-            t += DELAY_STRIDE_S
         if alarm_s is not None:
             results.append({"run_id": run_id, "delay_s": alarm_s - onset,
                             "delay_requests": alarm_requests})
+        n_faulty += 1
+        family = dataset.get("run_family", {}).get(run_id, ("unknown", "-"))
+        group = by_family.setdefault(family, {"runs": 0, "alarmed": 0,
+                                             "applied": 0, "neutral": 0,
+                                             "delays": []})
+        group["runs"] += 1
+        group["applied"] += int(bool(entry.get("successfully_applied")))
+        group["neutral"] += int("%s/%s" % (entry.get("pair_id"), family[0])
+                                in neutral)
+        if alarm_s is not None:
+            group["alarmed"] += 1
+            group["delays"].append(alarm_s - onset)
+    table = [{"fault_id": f[0], "severity": f[1], "runs": g["runs"],
+              "applied": g["applied"], "neutral": g["neutral"],
+              "alarmed": g["alarmed"],
+              "mean_s": float(np.mean(g["delays"])) if g["delays"] else -1.0}
+             for f, g in sorted(by_family.items())]
     if not results:
-        return {"n_runs": 0, "mean_s": -1.0, "median_s": -1.0,
-                "mean_requests": -1.0, "details": []}
+        return {"n_runs": 0, "n_faulty": n_faulty, "mean_s": -1.0,
+                "median_s": -1.0, "mean_requests": -1.0, "details": [],
+                "by_family": table}
     delays = [r["delay_s"] for r in results]
     return {
         "n_runs": len(results),
+        "n_faulty": n_faulty,
         "mean_s": float(np.mean(delays)),
         "median_s": float(np.median(delays)),
         "mean_requests": float(np.mean([r["delay_requests"] for r in results])),
         "details": results,
+        "by_family": table,
     }
+
+
+def recall_by_family(rows, predictions, run_family):
+    """Recall per (fault, severity), so a low pooled recall is explainable.
+
+    A missed positive is either an undetectable severity or a detector
+    failure; without this breakdown the two are indistinguishable, and the
+    report would have to guess which one 0.677 recall means.
+    """
+    groups = {}
+    for row, pred in zip(rows, predictions):
+        if row["label_kind"] not in POSITIVE_KINDS:
+            continue
+        family = run_family.get(row["run_id"], ("unknown", "-"))
+        g = groups.setdefault(family, {"n": 0, "hit": 0, "runs": set()})
+        g["n"] += 1
+        g["hit"] += int(pred)
+        g["runs"].add(row["run_id"])
+    out = []
+    for (fault_id, severity), g in sorted(groups.items()):
+        out.append({"fault_id": fault_id, "severity": severity,
+                    "windows": g["n"], "hits": g["hit"],
+                    "runs": len(g["runs"]),
+                    "recall": g["hit"] / float(g["n"]) if g["n"] else 0.0,
+                    "ci": wilson(g["hit"], g["n"])})
+    return out
+
+
+def workload_fpr(rows, baselines):
+    """False-alarm rate per workload, over unaffected windows only.
+
+    This is the M2 evidence, kept separate from the pooled FPR: a
+    detector that alarms on the `review_u75_bursty` workload-only negative
+    is responding to arrival shape, not to a fault, and the pooled number
+    hides that behind the healthy runs it shares a workload id with.
+    """
+    out = []
+    workloads = sorted({r["workload_id"] for r in rows})
+    for name, pred in baselines:
+        for workload in workloads:
+            n = 0
+            fp = 0
+            for row, p in zip(rows, pred):
+                if row["workload_id"] != workload:
+                    continue
+                if row["label_kind"] != KIND_UNAFFECTED:
+                    continue
+                n += 1
+                fp += int(p)
+            if not n:
+                continue
+            out.append({"baseline": name, "workload": workload,
+                        "windows": n, "false_alarms": fp,
+                        "fpr": fp / float(n), "ci": wilson(fp, n)})
+    return out
 
 
 # ===========================================================================
@@ -1170,8 +1365,10 @@ def main(argv=None):
         kind_counts[r["label_kind"]] = kind_counts.get(r["label_kind"], 0) + 1
 
     loc = localisation(all_rows, thr_res)
-    delay = detection_delay(dataset, data_root, thr_res)
+    delay = detection_delay(dataset, data_root)
     regimes = regime_table(all_rows)
+    wfpr = workload_fpr(rows, baselines)
+    family = recall_by_family(rows, pred_b, dataset["run_family"])
 
     # ---- write metrics.csv ------------------------------------------------
     csv_path = os.path.join(report_root, "metrics.csv")
@@ -1198,6 +1395,9 @@ def main(argv=None):
                 ("localization_coverage", "%.3f" % loc["coverage"]),
                 ("localization_selective_top1", "%.3f" % loc["selective_top1"]),
                 ("localization_windows", str(loc["windows"])),
+                ("localization_scored_positives", str(loc["scored"])),
+                ("localization_not_localisable", str(loc["link_positives"])),
+                ("localization_link_windows", str(loc["link_windows"])),
                 ("mean_detection_delay_s", "%.3f" % delay["mean_s"]),
                 ("median_detection_delay_s", "%.3f" % delay["median_s"]),
                 ("mean_detection_delay_requests", "%.3f" % delay["mean_requests"]),
@@ -1224,10 +1424,13 @@ def main(argv=None):
             "count", "dur_mean", "dur_residual", "dur_peer_ratio",
             "has_peer", "req_ttft_mean", "req_tpot_mean", "wait_mean",
             "run_mean", "throughput_per_s"]
+    # Every row, including the excluded kinds: the point of a dump is to let
+    # a reader check the exclusions, and a dump of `rows` alone hides the
+    # 2379 downstream / 554 neutral rows the report says it counted.
     with open(dump_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
-        for r in rows:
+        for r in all_rows:
             writer.writerow(r)
 
     # ---- human report ----------------------------------------------------
@@ -1236,13 +1439,15 @@ def main(argv=None):
         f.write("# Fault-detection report (transparent baselines)\n\n")
         f.write("Synthetic faults only: these numbers validate the detection "
                 "machinery, not real-hardware detection.\n\n")
-        f.write("Windows: %d (%d root-cause, %d unaffected), window %.1fs, "
-                "split by RUN, seed %d.\n\n"
+        f.write("Scored: %d windows (%d root-cause, %d unaffected) out of %d "
+                "rows, window %.1fs, split by RUN, seed %d.\n\n"
                 % (len(rows), int(y.sum()), int(len(y) - y.sum()),
-                   args.window_s, args.seed))
-        f.write("Excluded from the metric: downstream %d, recovering %d, "
-                "neutral %d. Runs with no audit activity: %d.\n\n"
-                % (kind_counts.get(KIND_DOWNSTREAM, 0),
+                   len(all_rows), args.window_s, args.seed))
+        f.write("Excluded from the metric, counted over all %d rows: "
+                "downstream %d, recovering %d, neutral %d. Runs with no audit "
+                "activity: %d.\n\n"
+                % (len(all_rows),
+                   kind_counts.get(KIND_DOWNSTREAM, 0),
                    kind_counts.get(KIND_RECOVERING, 0),
                    kind_counts.get(KIND_NEUTRAL, 0),
                    len(dataset["missing_audit"])))
@@ -1290,18 +1495,72 @@ def main(argv=None):
                         "FPR [%.2f, %.2f]\n"
                         % (row["baseline"], p_lo, p_hi, r_lo, r_hi,
                            f_lo, f_hi, fp_lo, fp_hi))
+        f.write("\n## Recall by fault family and severity (residual baseline)\n\n")
+        fam_total = sum(r["windows"] for r in family) or 1
+        fam_hits = sum(r["hits"] for r in family)
+        f.write("A pooled recall hides which severities are detectable. "
+                "These are all root-cause windows, train and test together "
+                "(%d of %d detected), split by the injected fault and its "
+                "severity knob.\n\n" % (fam_hits, fam_total))
+        f.write("| fault | severity | runs | root-cause windows | detected | recall | 95% CI |\n")
+        f.write("|---|---|---|---|---|---|---|\n")
+        for r in family:
+            f.write("| %s | %s | %d | %d | %d | %.3f | [%.3f, %.3f] |\n"
+                    % (r["fault_id"], r["severity"], r["runs"], r["windows"],
+                       r["hits"], r["recall"], r["ci"][0], r["ci"][1]))
+        f.write("\n## False alarms by workload (M2: workload skew vs fault)\n\n")
+        f.write("Unaffected windows only. `review_u75_bursty` is the "
+                "workload-only negative: same mean load as `review_u75`, "
+                "2x instantaneous rate, no fault injected.\n\n")
+        f.write("| baseline | workload | unaffected windows | false alarms | FPR | 95% CI |\n")
+        f.write("|---|---|---|---|---|---|\n")
+        for r in wfpr:
+            f.write("| %s | %s | %d | %d | %.3f | [%.3f, %.3f] |\n"
+                    % (r["baseline"], r["workload"], r["windows"],
+                       r["false_alarms"], r["fpr"], r["ci"][0], r["ci"][1]))
         f.write("\n## Localisation (per-instance residual ranking)\n\n")
-        f.write("Root-cause windows: %d. Top-1 %.3f (95%% CI [%.2f, %.2f]), "
-                "top-3 %.3f. Abstained windows: %d (coverage %.3f), "
-                "selective top-1 %.3f.\n"
-                % (loc["windows"], loc["top1"], loc["top1_ci"][0],
-                   loc["top1_ci"][1], loc["top3"], loc["abstained_windows"],
-                   loc["coverage"], loc["selective_top1"]))
-        f.write("\n## Detection delay\n\n")
-        f.write("Runs with an alarm: %d. Mean %.2fs / median %.2fs after onset, "
-                "%.1f requests completed in between (stride %.1fs).\n"
-                % (delay["n_runs"], delay["mean_s"], delay["median_s"],
-                   delay["mean_requests"], DELAY_STRIDE_S))
+        f.write("NPU-labelled root-cause windows: %d, positives %d. Top-1 %.3f "
+                "(95%% CI [%.2f, %.2f]), top-3 %.3f. Abstained windows: %d "
+                "(coverage %.3f), selective top-1 %.3f.\n"
+                % (loc["windows"], loc["scored"], loc["top1"],
+                   loc["top1_ci"][0], loc["top1_ci"][1], loc["top3"],
+                   loc["abstained_windows"], loc["coverage"],
+                   loc["selective_top1"]))
+        f.write("Not localisable by an NPU ranking: %d link-labelled positives "
+                "in %d windows (a transfer link is not an instance in the "
+                "candidate set, so these are counted here, not as hits).\n"
+                % (loc["link_positives"], loc["link_windows"]))
+        f.write("\n## Detection delay (batch-EWMA, calibrated on healthy runs)\n\n")
+        f.write("Faulty runs: %d, with an alarm: %d. Mean %.2fs / median %.2fs "
+                "after onset, %.1f requests completed in between (stride "
+                "%.1fs).\n\n"
+                % (delay["n_faulty"], delay["n_runs"], delay["mean_s"],
+                   delay["median_s"], delay["mean_requests"], DELAY_STRIDE_S))
+        f.write("| fault | severity | faulty runs | audit applied | "
+                "timing-neutral | runs with an alarm | mean delay (s) |\n")
+        f.write("|---|---|---|---|---|---|---|\n")
+        for r in delay["by_family"]:
+            f.write("| %s | %s | %d | %d | %d | %d | %s |\n"
+                    % (r["fault_id"], r["severity"], r["runs"], r["applied"],
+                       r["neutral"], r["alarmed"],
+                       "%.2f" % r["mean_s"] if r["mean_s"] >= 0 else "-"))
+        zero_recall = {(r["fault_id"], r["severity"])
+                       for r in family if r["recall"] == 0.0}
+        unattributable = [r for r in delay["by_family"] if r["alarmed"] and
+                          (r["applied"] == 0 or r["neutral"] == r["runs"] or
+                           (r["fault_id"], r["severity"]) in zero_recall)]
+        if unattributable:
+            f.write("\n**A crossing is not attributable to the fault.** These "
+                    "families alarmed although the audit shows the mechanism "
+                    "was never applied, although their severities produced "
+                    "bit-identical clocks, or although the window detector "
+                    "never detected them at all: %s. Their crossings measure "
+                    "the statistic, not the fault, so the mean delay above is "
+                    "an upper bound and the latency axis (M1) is not "
+                    "established by this dataset.\n"
+                    % ", ".join("%s/%s (%d of %d runs)"
+                                % (r["fault_id"], r["severity"], r["alarmed"],
+                                   r["runs"]) for r in unattributable))
         f.write("\n## Overhead\n\nPredict-only cost: %.4f ms/window "
                 "(fitting excluded).\n" % infer_ms)
         f.write("\nLow-severity faults may be undetectable; those negatives are "
