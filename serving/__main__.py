@@ -27,6 +27,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.timing_jitter import apply_timing_jitter
 import sys as flush
 
 from pyinstrument import Profiler
@@ -466,6 +467,13 @@ def main():
     parser.add_argument('--throttle-audit-output', type=str, default=None,
                         help='directory for the throttle ground-truth audit (throttle_audit.jsonl). Defaults to '
                         '--telemetry-output dir, else next to --output. Never mixed into telemetry CSVs.')
+    parser.add_argument('--timing-jitter', type=float, default=0.0,
+                        help='log-sd of a seeded, mean-preserving lognormal multiplier on per-layer compute '
+                        'latency (benign run-to-run noise). 0 = disabled and bit-identical (default). '
+                        'Communication sizes are never jittered. Sweep it (0.02/0.05/0.10) to report '
+                        'detectability as a function of benign noise.')
+    parser.add_argument('--timing-jitter-seed', type=int, default=1234,
+                        help='seed for --timing-jitter (keyed per instance/batch/row, order-independent)')
 
     args = parser.parse_args()
     
@@ -918,10 +926,7 @@ def main():
                 com = out_dict.get('com_cycle', 0)
                 # Report id is the batch's id + 1 (see add_done's id -= 1).
                 meta = batch_meta.get((instance_id, id - 1))
-                if meta is None:
-                    batch_telemetry.append((args.run_id, instance_id, id, sys, current, current,
-                                            0, 0, 0, 0, 0, 0, 0, 0, com))
-                else:
+                if meta is not None:
                     duration = current - meta["batch_time_ns"]
                     batch_telemetry.append((args.run_id, instance_id, id, sys,
                                             meta["batch_time_ns"], current, duration,
@@ -929,6 +934,10 @@ def main():
                                             meta["total_len"], meta["kv_len"],
                                             meta["pd_kv_send_tokens"],
                                             meta["n_waiting"], meta["n_running"], com))
+                # else: a start-up report (id 0) or a report whose batch
+                # predates telemetry. It is not a batch, so it writes no
+                # row. Previously it wrote a zero-duration, zero-shape row
+                # that biased the first window's mean downward (F7).
         # Throttle busy accounting is independent of --telemetry-output:
         # durations of ACTUAL completed simulated batches (never queue
         # length). Counted once per batch, on its first reporting NPU.
@@ -1143,6 +1152,10 @@ def main():
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root)
+                        if args.timing_jitter > 0:
+                            apply_timing_jitter(trace_data, args.timing_jitter,
+                                                args.timing_jitter_seed,
+                                                inst_id, batch.batch_id)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -1234,6 +1247,10 @@ def main():
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root)
+                            if args.timing_jitter > 0:
+                                apply_timing_jitter(trace_data, args.timing_jitter,
+                                                    args.timing_jitter_seed,
+                                                    inst_id, batch.batch_id)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -1280,6 +1297,13 @@ def main():
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    inputs_root=run_paths.inputs_root)
+                    if args.timing_jitter > 0:
+                        # Benign noise is applied BEFORE the fault
+                        # multiplier, so an injected fault scales the
+                        # noisy baseline rather than replacing it.
+                        apply_timing_jitter(trace_data, args.timing_jitter,
+                                            args.timing_jitter_seed,
+                                            instance_id, new_req.batch_id)
                     if fault_manager is not None:
                         role = instance.get("pd_type") or "prefill"
                         entries = apply_to_trace_rows(
@@ -1727,7 +1751,7 @@ def main():
         itl_path = os.path.join(args.telemetry_output, "request_itls.jsonl")
         with open(req_path, "w") as f, open(itl_path, "w") as g:
             f.write("request_id,prefill_instance_id,decode_instance_id,"
-                    "input_toks,output_toks,arrival_ns,first_scheduled_ns,"
+                    "input_toks,output_toks,generated_toks,arrival_ns,first_scheduled_ns,"
                     "prefill_done_ns,decode_admit_ns,first_decode_done_ns,"
                     "ttft_ns,latency_ns,queuing_delay_ns,tpot,"
                     "itl_count,itl_mean_ns,itl_p50_ns,itl_p99_ns,itl_max_ns\n")
@@ -1744,7 +1768,13 @@ def main():
                         mx = itls[-1]
                     f.write(",".join(str(v) for v in (
                         req.id, req.prefill_instance_id, req.decode_instance_id,
-                        req.original_input, req.output, req.arrival,
+                        req.original_input, req.output,
+                        # generated_toks: the number of tokens this request
+                        # actually generated. output_toks is the FINAL
+                        # sequence length (input + generated), which the
+                        # schema previously left ambiguous (F1).
+                        max(0, req.output - req.original_input),
+                        req.arrival,
                         req.first_scheduled_ns, req.prefill_done_ns,
                         req.decode_admit_ns, req.first_decode_done_ns,
                         req.ttft, req.latency, req.queuing_delay, req.tpot,

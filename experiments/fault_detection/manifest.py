@@ -25,6 +25,12 @@ MANIFEST_ONLY_COLUMNS = frozenset({
     "pair_id", "expected_label", "workload_id", "experiment_id",
 })
 
+# Substrings that must never appear in an observable VALUE. An identifier
+# that spells out the label (e.g. run_id "..._faulty") separates the
+# classes as cleanly as a ground-truth column would (review item N6).
+LEAKY_VALUE_TOKENS = ("fault", "healthy", "slow", "stall", "degrad",
+                      "throttle", "neutral")
+
 MODE_TO_FAILURE_CLASS = {
     "compute_multiplicative": "fail_slow",
     "compute_additive": "fail_slow",
@@ -74,17 +80,37 @@ def load_manifest(path):
 
 
 def check_observable_clean(telemetry_dir):
-    """Raise ValueError if an observable file has manifest-only columns."""
+    """Raise ValueError if an observable file leaks ground truth.
+
+    Two checks, both needed (review item N6):
+
+      * column names -- a manifest-only column must not exist;
+      * cell values -- an identifier that spells out the label (the sim
+        used to be invoked with ``--run-id <pair>_faulty``, which put the
+        word "faulty" in every batch row) is just as much a leak as a
+        column, and a detector reading run_id would trivially separate
+        the classes. Callers must pass an opaque run id.
+    """
     for name in ("batch_telemetry.csv", "request_telemetry.csv"):
         path = os.path.join(telemetry_dir, name)
         if not os.path.exists(path):
             continue
         with open(path) as f:
-            header = next(csv.reader(f), [])
-        leaked = [c for c in header if c in MANIFEST_ONLY_COLUMNS]
-        if leaked:
-            raise ValueError("observable file %s leaks ground truth columns: %s"
-                             % (path, leaked))
+            reader = csv.reader(f)
+            header = next(reader, [])
+            leaked = [c for c in header if c in MANIFEST_ONLY_COLUMNS]
+            if leaked:
+                raise ValueError("observable file %s leaks ground truth columns: %s"
+                                 % (path, leaked))
+            for row in reader:
+                for value in row:
+                    low = value.lower()
+                    hit = [t for t in LEAKY_VALUE_TOKENS if t in low]
+                    if hit:
+                        raise ValueError(
+                            "observable file %s leaks a label through a value "
+                            "(%r contains %s); pass an opaque run id"
+                            % (path, value, hit))
 
 
 def audit_within_interval(audit_records, fault):

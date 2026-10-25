@@ -1,0 +1,9 @@
+# Shell scripts must stay LF in the working tree. serving/validate.sh
+# compares clock strings with awk; a CRLF checkout leaves a trailing \r on
+# the field, so every scenario reports a false FAIL while the numeric
+# delta is +0.0000% (review item F16).
+#
+# Deliberately ONLY *.sh: the repo ships profiler/perf CSVs that are
+# compared byte-wise against recorded baselines, so normalising *.csv
+# here would rewrite committed data on checkout.
+*.sh text eol=lf

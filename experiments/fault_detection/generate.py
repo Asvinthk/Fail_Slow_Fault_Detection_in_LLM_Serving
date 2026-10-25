@@ -17,6 +17,7 @@ Generated data stays gitignored (experiments/out/).
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -28,6 +29,7 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from experiments.fault_detection.workloads import generate as generate_workload  # noqa: E402
+from experiments.fault_detection.regime import regime_from_telemetry  # noqa: E402
 from experiments.fault_detection.manifest import (  # noqa: E402
     MODE_TO_FAILURE_CLASS,
     check_audit_consistency,
@@ -135,6 +137,12 @@ def run_one(repo_root, out_root, pair_id, job, faults, seed, timeout,
                       fault_spec))
     for suffix, fault_spec in twins:
         run_id = "%s_%s" % (pair_id, suffix)
+        # The sim writes --run-id into every observable batch row. A
+        # readable id ("<pair>_faulty") leaks the label through a VALUE,
+        # which check_observable_clean now rejects (review item N6). The
+        # manifest keeps the readable id; the sim gets an opaque token.
+        telemetry_run_id = "run_%s" % hashlib.sha256(
+            ("%s|%s|%d" % (pair_id, suffix, seed)).encode()).hexdigest()[:12]
         telemetry_dir = os.path.join(pair_dir, "%s_telemetry" % suffix)
         os.makedirs(telemetry_dir, exist_ok=True)
         csv_path = os.path.join(pair_dir, "%s.csv" % suffix)
@@ -160,7 +168,7 @@ def run_one(repo_root, out_root, pair_id, job, faults, seed, timeout,
                "--dataset", os.path.relpath(workload_path, repo_root),
                "--output", os.path.relpath(csv_path, repo_root),
                "--num-reqs", str(len(open(workload_path).readlines())),
-               "--run-id", run_id,
+               "--run-id", telemetry_run_id,
                "--inputs-root", inputs_arg,
                "--telemetry-output", os.path.relpath(telemetry_dir, repo_root)]
         if fault_path is not None:
@@ -218,6 +226,9 @@ def run_one(repo_root, out_root, pair_id, job, faults, seed, timeout,
             "status": status,
             "reason": reason + ("; %s" % leak if leak else ""),
             "total_clocks_ns": clocks,
+            # Regime: the load a number was measured at. A detection
+            # result is meaningless without it (review P1 item 9).
+            "regime": regime_from_telemetry(telemetry_dir),
         }
         results.append(entry)
     return results

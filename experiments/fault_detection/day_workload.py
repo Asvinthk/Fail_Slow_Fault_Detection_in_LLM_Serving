@@ -15,6 +15,25 @@ Arrival model: non-homogeneous Poisson process via thinning.
   - bursts:    optional short seeded bursts (count, rate multiplier,
     duration).
 
+Thinning bound: the acceptance bound is the supremum of the FULL
+intensity (diurnal shape PLUS every burst term) on a fine grid, not the
+max of the two terms taken separately. The old code used
+``max(base*(1+peak_height), base*burst_mult)``, which is not an upper
+bound when a burst overlaps the noon peak: at the default peak the
+intensity inside a burst reaches base*(1+peak_height) + base*(mult-1) =
+10 req/s against an 8 req/s bound, so rate/max > 1 and every candidate
+was accepted -- a 600 s x2 burst added 22 requests instead of ~1200.
+Fixed after external review (F4); ``tests/test_day_workload.py`` now
+regresses the realised burst volume against the analytic integral.
+
+Known limitation (disclosed, not fixed): the profile is a ONE-SHOT day,
+not a periodic process. rate(23.99h) ~= 0.015 req/s against
+rate(0.1h) ~= 0.40 req/s, a ~27x step at midnight, because the afternoon
+decay is ~0.02 at the end of the day while the morning ramp restarts at
+1.0. Concatenating two generated days is therefore not a steady-state
+continuation. A periodic model needs a smooth diurnal basis (a wrapped
+harmonic) rather than the piecewise morning/peak/afternoon terms.
+
 All randomness from random.Random(seed): reproducible. Identical config +
 seed gives byte-identical output.
 
@@ -66,16 +85,64 @@ def rate_at(t_s, cfg):
     return max(rate, 0.0)
 
 
+def intensity_at(t_s, cfg, bursts=None):
+    """Full instantaneous arrival rate: diurnal shape + every burst term.
+
+    This is the ONLY function that defines the process. Thinning accepts
+    with ``intensity_at(t) / max_intensity(cfg)``, so the bound must be
+    computed from this same function -- computing it from the peak and
+    the bursts separately is not a bound when they overlap (F4).
+    """
+    r = rate_at(t_s, cfg)
+    for b in bursts or cfg.get("bursts", []):
+        start = b.get("start_s")
+        if start is None:
+            continue
+        if start <= t_s < start + b.get("dur_s", 60.0):
+            r += cfg["base_sps"] * (b.get("rate_mult", 2.0) - 1.0)
+    return max(r, 0.0)
+
+
+def max_intensity(cfg, bursts=None, step_s=1.0):
+    """Supremum of intensity_at over the horizon (grid + burst edges).
+
+    A 1 s grid over 24 h is 86,400 evaluations -- cheap, and the diurnal
+    terms move by well under one percent between samples. Burst edges are
+    evaluated exactly because the burst term is piecewise constant and a
+    short burst can be narrower than the grid step.
+    """
+    horizon_s = cfg["horizon_s"]
+    step = max(float(step_s), 0.1)
+    best = 0.0
+    t = 0.0
+    while t < horizon_s:
+        best = max(best, intensity_at(t, cfg, bursts))
+        t += step
+    for b in bursts or cfg.get("bursts", []):
+        for edge in (b.get("start_s"), b.get("start_s", 0.0) + b.get("dur_s", 60.0) - 1e-9):
+            if edge is not None and 0.0 <= edge < horizon_s:
+                best = max(best, intensity_at(edge, cfg, bursts))
+    return max(best, 1e-9)
+
+
+def expected_count(cfg, bursts=None, step_s=1.0):
+    """Analytic expectation of the number of arrivals (integral of intensity)."""
+    horizon_s = cfg["horizon_s"]
+    step = max(float(step_s), 0.1)
+    total = 0.0
+    t = 0.0
+    while t < horizon_s:
+        total += intensity_at(t, cfg, bursts) * step
+        t += step
+    return total
+
+
 def generate(cfg):
     rnd = random.Random(cfg["seed"])
     horizon_s = cfg["horizon_s"]
-    # Thinning: candidate events at max_rate, accept with p = rate/max.
-    peak_max = cfg["base_sps"] * (1.0 + cfg["peak_height"]) + 1e-9
-    burst_max = 0.0
-    for b in cfg.get("bursts", []):
-        burst_max = max(burst_max, cfg["base_sps"] * b.get("rate_mult", 2.0))
-    max_rate = max(peak_max, burst_max, 1e-9)
-    # Burst windows (seeded placement unless explicit start given).
+    # Burst windows (seeded placement unless explicit start given). They
+    # are resolved BEFORE the bound, because the bound depends on where
+    # they land.
     bursts = []
     for b in cfg.get("bursts", []):
         start = b.get("start_s")
@@ -83,16 +150,16 @@ def generate(cfg):
             start = rnd.uniform(0, max(horizon_s - b.get("dur_s", 60.0), 0.0))
         bursts.append({"start_s": start, "dur_s": b.get("dur_s", 60.0),
                        "rate_mult": b.get("rate_mult", 2.0)})
+    # Thinning: candidates at the true supremum of the full intensity,
+    # accept with p = intensity/max. See the module docstring (F4).
+    max_rate = max_intensity(cfg, bursts)
     t = 0.0
     arrivals = []
     while True:
         t += rnd.expovariate(max_rate)
         if t >= horizon_s:
             break
-        r = rate_at(t, cfg)
-        for b in bursts:
-            if b["start_s"] <= t < b["start_s"] + b["dur_s"]:
-                r += cfg["base_sps"] * (b["rate_mult"] - 1.0)
+        r = intensity_at(t, cfg, bursts)
         if rnd.random() < r / max_rate:
             arrivals.append(t)
     rows = []
