@@ -707,9 +707,9 @@ done, 0 failed run(s)
 ```
 
 100 manifest lines: 15 healthy twins + 85 faulty twins (5 seeds x
-(u40 7 twins + u75 11 twins + bursty 1 twin)). Wall clock ~85 min at 3
-workers, i.e. ~1.1 runs/min, I/O bound on the Windows bind mount. The
-evaluation that produced `report.md` §16.5:
+(u40 7 runs + u75 12 runs + bursty 1 run) = 20 per seed). Wall clock ~85
+min at 3 workers, i.e. ~1.1 runs/min, I/O bound on the Windows bind
+mount. The evaluation that produced `report.md` §16.5:
 
 ```
 python -m experiments.fault_detection.evaluate \
