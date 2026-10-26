@@ -815,3 +815,38 @@ latency without the reader having to reconstruct the table.
 Smoke bundle re-checked with the same code: 33 windows, 8 `root_cause`,
 25 `unaffected`, 7 `downstream`, `localization_top1=1.000` over 5 NPU
 positives, 3 link positives reported as not localisable.
+
+### 16. Publishing: `fail_slow/main` cannot be fast-forwarded
+
+The push was attempted and rejected, which is worth recording because the
+remote is not what its name suggests:
+
+```
+git push fail_slow main
+ ! [rejected]        main -> main (non-fast-forward)
+
+git merge-base HEAD fail_slow/main        -> (empty, no shared ancestor)
+git log -1 --format=%s fail_slow/main     -> make fault detection experiments reproducible
+git diff --stat fail_slow/main e691da5    -> (empty, identical trees)
+git rev-list --count e691da5..HEAD        -> 8
+```
+
+`fail_slow/main` is a two-commit squashed snapshot (`initial commit of
+serving sim ml model not implemented` + the reproducible-experiments
+commit) whose tree is byte-identical to our `e691da5`. It is eight
+commits behind in content and shares no ancestor, so nothing can be
+fast-forwarded onto it. Rewriting it was declined, so the work is
+published on its own branch:
+
+```
+git push -u fail_slow main:refs/heads/fail_slow/instrument-repair
+ * [new branch]      main -> fail_slow/instrument-repair
+git ls-remote fail_slow refs/heads/fail_slow/instrument-repair
+ 225a46f65a24060101fbe26405a20086cc717b06
+git rev-parse HEAD
+ 225a46f65a24060101fbe26405a20086cc717b06
+```
+
+`fail_slow/main` still points at `810da2b` and is untouched. The local
+`main` branch tracks `origin/main` again (the `-u` briefly pointed it at
+the new remote branch; restored with `git branch -u origin/main main`).
