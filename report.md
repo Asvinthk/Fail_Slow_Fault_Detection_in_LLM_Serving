@@ -71,3 +71,7 @@ Re-run from the repository root after placing the two existing run folders under
 ```powershell
 python research/fault_detection/train_qwen32_binary_and_stage_regressors.py --data-root research/out/qwen32_single_300_uniform_training --out research/out/qwen32_single_300_uniform_training/model_results --seed 23
 ```
+
+## GitHub repository
+
+**Fail_Slow_Fault_Detection_in_LLM_Serving** — [github.com/Asvinthk/Fail_Slow_Fault_Detection_in_LLM_Serving](https://github.com/Asvinthk/Fail_Slow_Fault_Detection_in_LLM_Serving)
