@@ -1,10 +1,4 @@
-"""Train leakage-controlled prototypes on the paired Qwen3-32B 300-request runs.
-
-The binary target is run condition (healthy replay vs combined synthetic-fault
-run), not independently verified SLO failure.  Localization is intentionally
-not fitted unless all three truthful component labels exist.  Stage targets
-are measured healthy replay intervals, not counterfactual subtractions.
-"""
+"""Train binary healthy/faulty and healthy-only stage-time models."""
 
 from __future__ import annotations
 
@@ -21,7 +15,7 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
                              confusion_matrix, f1_score, mean_absolute_error,
                              mean_squared_error, precision_score, r2_score,
                              recall_score, roc_auc_score)
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -31,7 +25,10 @@ FEATURES = [
     "prefill_waiting_before", "prefill_running_before",
     "total_prefill_waiting_before", "total_prefill_running_before",
     "total_decode_waiting_before", "total_decode_running_before",
-    "pending_unrouted_before",
+    "pending_unrouted_before", "prefill_service_observed_ns",
+    "transfer_interval_observed_ns", "decode_itl_sum_observed_ns",
+    "ttft_ns", "latency_ns", "queuing_delay_ns", "tpot_ns",
+    "itl_mean_ns", "itl_p99_ns", "itl_max_ns",
 ]
 STAGES = {
     "prefill": "prefill_service_observed_ns",
@@ -45,11 +42,6 @@ FORBIDDEN_NAMES = ("label", "fault_id", "audit", "added", "delta",
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as stream:
         return list(csv.DictReader(stream))
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8") as stream:
-        return [json.loads(line) for line in stream if line.strip()]
 
 
 def safe_features(run_dir: Path) -> list[dict]:
@@ -69,15 +61,32 @@ def safe_features(run_dir: Path) -> list[dict]:
             "route_lag_ns": float(q["route_lag_ns"]),
         }
         previous_arrival = arrival
-        for key in FEATURES[4:]:
+        for key in FEATURES[4:11]:
             vals[key] = float(q[key])
+        # The healthy and faulty exporters used different names for the same
+        # observed prefill interval; normalize them to one feature name.
+        aliases = {
+            "prefill_service_observed_ns": ("prefill_service_observed_ns", "prefill_observed_ns"),
+            "transfer_interval_observed_ns": ("transfer_interval_observed_ns",),
+            "decode_itl_sum_observed_ns": ("decode_itl_sum_observed_ns",),
+        }
+        for name, candidates in aliases.items():
+            value = next((r[c] for c in candidates if c in r), None)
+            if value is None:
+                raise ValueError(f"{run_dir.name} request {rid} missing observed feature {name}")
+            vals[name] = float(value)
+        for name, raw_name in (("ttft_ns", "ttft_ns"), ("latency_ns", "latency_ns"),
+                               ("queuing_delay_ns", "queuing_delay_ns"),
+                               ("tpot_ns", "tpot"), ("itl_mean_ns", "itl_mean_ns"),
+                               ("itl_p99_ns", "itl_p99_ns"), ("itl_max_ns", "itl_max_ns")):
+            vals[name] = float(r[raw_name])
         result.append({"request_id": rid, "arrival_ns": arrival,
                        "features": vals, "raw": r})
     return result
 
 
-def matrix(rows: list[dict]) -> np.ndarray:
-    return np.asarray([[r["features"][name] for name in FEATURES] for r in rows], dtype=float)
+def matrix(rows: list[dict], features: list[str] = FEATURES) -> np.ndarray:
+    return np.asarray([[r["features"][name] for name in features] for r in rows], dtype=float)
 
 
 def assert_no_leakage() -> None:
@@ -101,7 +110,7 @@ def classifier(healthy: list[dict], faulty: list[dict], output: Path, seed: int)
     cm = confusion_matrix(y[test_idx], pred, labels=[0, 1])
     report = {
         "model": "logistic regression; median imputation + standard scaling fitted on training partition",
-        "target": "condition membership: healthy replay=0, combined-fault run=1; synthetic exposure proxy, not SLO ground truth",
+        "target": "condition membership: healthy replay=0, combined-fault run=1; synthetic healthy-versus-faulty label, not an independently calibrated SLO threshold",
         "features": FEATURES,
         "counts": {"healthy": len(healthy), "combined_fault": len(faulty),
                    "train": len(train_idx), "test": len(test_idx),
@@ -116,38 +125,19 @@ def classifier(healthy: list[dict], faulty: list[dict], output: Path, seed: int)
         "f1_faulty": float(f1_score(y[test_idx], pred, zero_division=0)),
         "roc_auc": float(roc_auc_score(y[test_idx], prob)),
         "confusion_matrix_true_rows_healthy_faulty_pred_columns_healthy_faulty": cm.tolist(),
-        "caveat": "single matched workload and topology; post-request observable timing features make this post-completion condition classification, not online alarm evaluation",
+        "feature_timing": "uses directly observed per-request prefill, transfer/handoff, and decode timing telemetry; prediction is made after request timing is available",
+        "caveat": "single matched workload and topology; post-request observable timing features make this completed-request healthy-versus-faulty classifier, not an early-warning or unseen-workload evaluation",
     }
     joblib.dump({"model": model, "features": FEATURES, "report": report}, output / "classifier.joblib")
     (output / "classifier_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 
-def localization(faulty: list[dict], output: Path, seed: int) -> dict:
-    # Request level stage-compute deltas are not per-fault attribution. Handoff
-    # audit is component-wide and network/KV/thermal are simultaneous, so no
-    # valid exclusive per-request labels are available for the required classes.
-    audit = read_jsonl(output.parent / "qwen32_single_300_uniform_four_faults" /
-                       "telemetry" / "injection_audit.jsonl")
-    fault_config = json.loads((output.parent / "qwen32_single_300_uniform_four_faults" /
-                               "fault_config.json").read_text(encoding="utf-8"))
-    available = sorted({item.get("fault_id") for item in audit if item.get("applied") and item.get("fault_id")})
-    configured = sorted(f["fault_id"] for f in fault_config.get("faults", []))
-    report = {
-        "status": "not_trained: valid three-class per-request labels unavailable",
-        "requested_classes": ["prefill", "decode", "kv_transfer"],
-        "configured_fault_ids": configured,
-        "applied_fault_ids": available,
-        "faulty_requests": len(faulty), "seed": seed,
-        "reason": "all configured transfer/network mechanisms and thermal throttling co-occur; audits are batch/component level and do not provide exclusive request-level culprit labels. A combined exposure label cannot train a component localizer.",
-        "model_metrics": None,
-    }
-    (output / "localizer_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    return report
-
-
 def regression(healthy: list[dict], output: Path, seed: int) -> dict:
-    X = matrix(healthy)
+    # Use only request-time workload/queue features. Stage targets and other
+    # completed-request timing telemetry must never predict themselves.
+    regression_features = FEATURES[:11]
+    X = matrix(healthy, regression_features)
     arrivals = np.asarray([r["arrival_ns"] for r in healthy])
     # Temporal holdout preserves causal ordering and avoids near-duplicate
     # neighboring arrivals leaking across partitions.
@@ -169,12 +159,12 @@ def regression(healthy: list[dict], output: Path, seed: int) -> dict:
             "r2": float(r2_score(y[test_idx], pred)),
             "mean_baseline_mae_ms": float(mean_absolute_error(y[test_idx], baseline)),
         }
-        joblib.dump({"model": model, "features": FEATURES, "target": column},
+        joblib.dump({"model": model, "features": regression_features, "target": column},
                     output / f"{stage}_regressor.joblib")
     report = {
         "model": "linear regression; median imputation + standard scaling fitted on training partition",
         "training_condition": "healthy replay only",
-        "features": FEATURES,
+        "features": regression_features,
         "counts": {"healthy_total": len(healthy), "train": int(len(train_idx)), "test": int(len(test_idx))},
         "split": "chronological 75/25 by request arrival order", "seed": seed,
         "targets": targets,
@@ -210,17 +200,20 @@ def main() -> None:
             if str(h_by[rid]["raw"][key]) != str(f_by[rid]["raw"][key]):
                 raise ValueError(f"paired request {rid} differs at {key}")
     args.out.mkdir(parents=True, exist_ok=True)
+    stale_localizer_report = args.out / "localizer_report.json"
+    if stale_localizer_report.exists():
+        stale_localizer_report.unlink()
     summary = {
         "paired_ids": 300, "id_min": min(h_ids), "id_max": max(h_ids),
         "arrival_and_prompt_output_lengths_match": True,
         "data_sources": {"healthy": str(healthy_dir), "combined_fault": str(faulty_dir)},
         "classifier": classifier(healthy, faulty, args.out, args.seed),
-        "localizer": localization(faulty, args.out, args.seed),
         "regression": regression(healthy, args.out, args.seed),
         "leakage_controls": {
             "excluded": ["request_id", "instance IDs", "absolute timestamps", "labels",
                          "fault IDs/config", "audit/ledger/manifest", "added-time and compute-delta fields"],
-            "classifier_features_are": "request workload covariates and queue state before/at admission only",
+            "classifier_features_are": "workload/queue covariates plus directly observed stage/completion timings; no injection truth or added-time fields",
+            "regression_features_are": "workload/queue covariates only; observed timing targets excluded from predictors",
             "regression_fit_data": "healthy only",
         },
     }
@@ -228,7 +221,6 @@ def main() -> None:
     print(json.dumps({"matched_ids": 300,
                       "classifier": {k: summary["classifier"][k] for k in
                                      ("accuracy", "balanced_accuracy", "precision_faulty", "recall_faulty", "f1_faulty", "roc_auc", "confusion_matrix_true_rows_healthy_faulty_pred_columns_healthy_faulty")},
-                      "localizer": summary["localizer"]["status"],
                       "regression": summary["regression"]["targets"]}, indent=2))
 
 

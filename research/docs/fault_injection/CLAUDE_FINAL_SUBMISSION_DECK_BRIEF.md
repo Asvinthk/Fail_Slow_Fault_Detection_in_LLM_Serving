@@ -1,4 +1,4 @@
-# Gemini deck creation brief — final project submission
+# Claude deck creation brief — final project submission
 
 Create an editable university research presentation and a PDF preview for **Fail-Slow Detection in PD-Disaggregated LLM Serving**. Use the attached earlier presentation as a visual reference for its dark technical theme, diagrams, and restrained accent colors. Improve legibility and use clean, readable type. Do not copy old results when this brief gives updated evidence. Do not invent facts. Target 18 slides unless the source presentation and presentation constraints make that impossible; do not force content into tiny text. No video is requested: the system behavior is a simulator and data-analysis workflow, so the demonstration is a reproducible live walkthrough.
 
@@ -8,7 +8,7 @@ Audience: university project evaluator who may ask implementation and methodolog
 
 ## Core problem
 
-In prefill/decode (PD) disaggregation, requests queue, run prefill, transfer KV-cache state, then decode tokens. A fail-slow component remains operational but becomes slower. Workload variation can look similar, so a useful system should detect slowdown (M1), distinguish component degradation from workload skew (M2), and localize a culprit in prefill, decode, or transfer (M3). This project's prototype uses synthetic faults in a serving simulator; it does not validate detection on real hardware.
+In prefill/decode (PD) disaggregation, requests queue, run prefill, transfer KV-cache state, then decode tokens. A fail-slow component remains operational but becomes slower. Workload variation can look similar, so a useful system should detect slowdown (M1), distinguish component degradation from workload skew (M2), and ideally localize a culprit (M3). This project's selected prototype implements only healthy-versus-faulty classification and healthy-only timing regression; component localization is outside its scope. It uses synthetic faults in a serving simulator and does not validate detection on real hardware.
 
 ## Explain the simulator accurately
 
@@ -20,21 +20,14 @@ The laptop/server does not execute Qwen3-32B weights in the studied workflow. AS
 
 Separate upstream LLMServingSim scheduling/profile/trace/simulation behavior from this project's synthetic injection hooks, telemetry exports, audit/ledger capture, paired analysis, and ML experiments. Ground-truth labels and audits are evaluation-only and excluded from model features.
 
-## Updated three-model workflow
+## Selected two-model workflow
 
-Show a cascade:
+Show the two independent models:
 
-1. **Binary logistic classifier:** 300 healthy replay rows + 300 combined-fault rows, same 300 request IDs. Features: workload and pre-service queue/routing covariates. Median imputation and standard scaling fitted on training partition. Reproducible seed 23; 75/25 split grouped by request ID to keep matched pairs together. Held-out confusion matrix, true rows/predicted columns (healthy, faulty): `[[75, 0], [10, 65]]`. Accuracy 93.33%, balanced accuracy 93.33%, faulty precision 100.00%, recall 86.67%, F1 92.86%, ROC AUC 0.9877. This is run-condition discrimination on one matched workload, not verified SLO alarm performance, detection delay, or unseen-workload generalization.
-2. **Three-way localizer:** intended classes prefill/decode/KV transfer and invoked only after a positive classifier result. **Not trained on this dataset.** The faulty run has simultaneous KV-transfer bandwidth, collective-network, and handoff-delay mechanisms plus thermal throttle; its audits are batch/component-level and do not give valid exclusive per-request labels for all three classes. Do not make up labels or localization scores. Mark this stage as pending isolated component-labeled data.
-3. **Healthy-only stage-time regressors:** trained only on healthy rows; chronological split 225 train / 75 test; preprocessing fitted only to training. Prefill service = first scheduled to prefill completion. Transfer target = decode admission minus prefill completion. Decode target = mean ITL times ITL count (aggregate proxy). Results:
+1. **Binary healthy-versus-faulty logistic regression:** 300 healthy replay rows + 300 combined-fault rows, same 300 request IDs. Use workload/queue context plus directly observed prefill, KV handoff/transfer, and decode timing telemetry. Exclude label, fault IDs, audits, ledger, manifest, injected added-time/delta fields, request IDs, and absolute timestamps. Median imputation and standard scaling are fitted on the training partition only. Reproducible seed 23; 75/25 split grouped by request ID so matched rows stay together. Held-out metrics: accuracy 100.00%, balanced accuracy 100.00%, faulty precision/recall/F1 100.00%, ROC AUC 1.0000; confusion matrix (true rows, predicted columns: healthy/faulty) `[[75, 0], [0, 75]]`. This uses observed request timing, so call it retrospective request classification, not early warning or proof of unseen-workload generalization.
+2. **Healthy-only stage-time regressors:** trained only on healthy rows; chronological split 225 train / 75 test; preprocessing fitted only to training. Use workload and pre-service queue features only; exclude each observed stage target and all completed timing telemetry from that target's predictors. Prefill service = first scheduled to prefill completion. Transfer target = decode admission minus prefill completion. Decode target = mean ITL times ITL count (aggregate proxy). Held-out metrics (MAE/RMSE/R²): prefill 1.661/1.979 ms/0.9909; KV transfer 0/0 ms/1.0000; decode 12.113/18.738 ms/0.9999. The transfer interval is zero for every healthy row; its perfect score is a degenerate constant target, not learned transfer prediction. The decode fit reflects this workload and needs cross-workload validation.
 
-| Stage | MAE ms | RMSE ms | R² | Mean baseline MAE ms |
-|---|---:|---:|---:|---:|
-| Prefill | 1.661 | 1.979 | 0.9909 | 18.592 |
-| KV transfer/handoff | 0.000 | 0.000 | 1.0000 | 0.000 |
-| Decode | 12.113 | 18.738 | 0.9999 | 1,756.356 |
-
-Explain that the transfer interval is zero for every healthy row; the perfect score is a degenerate constant target, not learned transfer prediction. The high decode score reflects this particular workload's token pattern and needs cross-workload validation. Regressors are a baseline prototype only: no residual threshold or per-request alarm is implemented.
+Regressors are a baseline prototype only: no residual threshold or per-request alarm is implemented. Component localization is out of scope for this selected two-model prototype; do not show a third classifier or component localization metrics.
 
 ## Dataset and counterfactual honesty
 
@@ -52,30 +45,30 @@ The faulty ledger contains compute deltas and communication-volume changes, not 
 6. Upstream simulator versus this project extension.
 7. System/configuration under study: Qwen3-32B, 2P2D TP2, same topology for the paired runs.
 8. Existing fault mechanisms and telemetry (careful actual configuration).
-9. Three-model architecture and feature/label separation.
+9. Two-model architecture and feature/label separation.
 10. Paired dataset, request-ID audit, and split strategy.
 11. Logistic-regression results with confusion matrix.
-12. Localization stage: why it is not trained; exact additional evidence required.
-13. Healthy-only regression targets and train-only preprocessing.
-14. Stage regression metrics and zero-transfer caveat.
-15. Counterfactual limits and distinction between measured replay and ledger deltas.
-16. End-to-end demonstration walkthrough (load existing telemetry, inspect IDs/features, run trainer, inspect metrics/artifacts; no video).
-17. Limitations, complete/partial/pending status, next experiments.
+12. Stage regression targets and train-only preprocessing.
+13. Stage regression metrics and zero-transfer caveat.
+14. Counterfactual limits and distinction between measured replay and ledger deltas.
+15. End-to-end demonstration walkthrough (load existing telemetry, inspect IDs/features, run trainer, inspect metrics/artifacts; no video).
+16. Limitations and complete/pending status.
+17. Next experiments and reproducibility evidence.
 18. Conclusion and selected sources.
 
 ## Demo plan slide
 
-Present a short live terminal/notebook walkthrough using already completed runs: (a) show the two run manifests and 300-row exports, (b) run the reproducible trainer command, (c) display `training_summary.json`, confusion matrix and stage metrics, (d) show that no localizer model was emitted because labels are invalid, (e) point to run log and report. Do not run new simulations as part of the demo.
+Present a short live terminal/notebook walkthrough using already completed runs: (a) show the two run manifests and 300-row exports, (b) run the reproducible trainer command, (c) display `training_summary.json`, classifier confusion matrix, and stage metrics, (d) show that the selected design contains only the binary classifier and healthy-only regressors, (e) point to run log and report. Do not run new simulations as part of the demo.
 
 ## Visual and evidence rules
 
 - Match the earlier deck's dark technical identity, with consistent fonts, high contrast, and simple stage diagrams.
 - Use readable tables and one strong evidence chart; do not shrink copy to fit.
 - No repeated footer/source strip. Put a small selected-source list on the final slide.
-- Keep classifier, localizer, and regressor visually distinct. Show that classifier-positive is the intended localizer gate and the regressor is a separate healthy baseline path.
+- Show the binary classifier and the separate healthy-only timing regressors; do not include a component localizer in this version.
 - No claim that synthetic faults prove real-hardware detection.
 - No invented localization scores, detection latency, false-positive rate under workload skew, SLO threshold validation, or serving overhead measurement.
-- Mark status: complete (ID audit, binary model, healthy stage regressors), partial (cascade without localizer), pending (isolated labels, multi-run/workload evaluation, residual alarm and deployment evidence).
+- Mark status: complete (ID audit, binary model using measured timing telemetry, healthy stage regressors), pending (multi-run/workload evaluation, residual alarm validation, deployment evidence).
 
 ## Selected official simulator sources
 
@@ -89,6 +82,6 @@ Present a short live terminal/notebook walkthrough using already completed runs:
 
 ## Project sources
 
-- `QWEN32_SINGLE_300_THREE_MODEL_RESULTS.md` (authoritative for the new 300-row model results)
+- `QWEN32_SINGLE_300_TWO_MODEL_RESULTS.md` (authoritative for the selected two-model prototype's new 300-row results)
 - `RUNLOG.md` (executed commands and exact outputs)
 - Existing `QWEN32_PRESENTATION_BRIEF_AND_DEEPSEEK_PROMPT.md`, `QWEN32_PER_FAULT_RESULTS.md`, `QWEN32_SERVICE_TIME_REGRESSION.md`, and `QWEN32_FAULT_SLOWDOWN.md` for earlier study context only; do not mix their 1,000-row results into the new 300-row experiment.

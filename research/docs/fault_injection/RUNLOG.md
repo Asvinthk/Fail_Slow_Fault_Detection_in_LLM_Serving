@@ -62,3 +62,84 @@ Training command: `python research/fault_detection/train_qwen32_uniform_three_mo
 ```
 
 No simulations were run. The faulty config has three transfer/network mechanisms plus a separate thermal throttle configuration; the directory's `four_faults` name is not four exclusive per-request classes. Communication ledger volume deltas are not exact timing counterfactuals. Healthy replay transfer intervals are all zero, so its transfer regression is a constant-target result.
+
+## Corrected two-model implementation — 2026-11-21
+
+The earlier exploratory run used workload/queue features for the classifier and reported 93.33% accuracy. The user clarified that the intended binary classifier should learn from observed stage slowdown telemetry, and selected only two models: the binary classifier and healthy-only stage regressors. Component localization was removed from the plan and code. The earlier classifier metric is superseded below.
+
+### Schema normalization attempts (failures retained)
+
+First command:
+
+```text
+python research/fault_detection/train_qwen32_uniform_three_models.py --data-root ..\LLMServingSim\research\out\qwen32_single_300_uniform_training --out ..\LLMServingSim\research\out\qwen32_single_300_uniform_training\model_results --seed 23
+```
+
+Exit code: 1. Exact error:
+
+```text
+KeyError: 'prefill_observed_ns'
+```
+
+After changing the feature name, the same command failed with exit code 1. Exact error:
+
+```text
+KeyError: 'prefill_service_observed_ns'
+```
+
+The healthy and faulty exporters use different prefill column names. The trainer now normalizes both to a shared observed-prefill feature before model construction.
+
+### Reproducible two-model run
+
+Command:
+
+```text
+python research/fault_detection/train_qwen32_binary_and_stage_regressors.py --data-root ..\LLMServingSim\research\out\qwen32_single_300_uniform_training --out ..\LLMServingSim\research\out\qwen32_single_300_uniform_training\model_results --seed 23
+```
+
+Exit code: 0. Exact output:
+
+```json
+{
+  "matched_ids": 300,
+  "classifier": {
+    "accuracy": 1.0,
+    "balanced_accuracy": 1.0,
+    "precision_faulty": 1.0,
+    "recall_faulty": 1.0,
+    "f1_faulty": 1.0,
+    "roc_auc": 1.0,
+    "confusion_matrix_true_rows_healthy_faulty_pred_columns_healthy_faulty": [[75, 0], [0, 75]]
+  },
+  "regression": {
+    "prefill": {"target": "prefill_service_observed_ns / 1e6 (ms)", "train_rows": 225, "test_rows": 75, "mae_ms": 1.6612943436084706, "rmse_ms": 1.9792415332118245, "r2": 0.9909457447951636, "mean_baseline_mae_ms": 18.592403394133335},
+    "kv_transfer": {"target": "transfer_interval_observed_ns / 1e6 (ms)", "train_rows": 225, "test_rows": 75, "mae_ms": 0.0, "rmse_ms": 0.0, "r2": 1.0, "mean_baseline_mae_ms": 0.0},
+    "decode": {"target": "decode_itl_sum_observed_ns / 1e6 (ms)", "train_rows": 225, "test_rows": 75, "mae_ms": 12.11323202878181, "rmse_ms": 18.7375703656339, "r2": 0.9999064567534836, "mean_baseline_mae_ms": 1756.3561093101632}
+  }
+}
+```
+
+Classifier inputs are measured per-request prefill, transfer/handoff, decode, TTFT, completion, queuing and ITL timing plus workload/queue context. These are legitimate observed telemetry features, not label or injection ground truth. The classifier therefore predicts completed-request healthy/faulty condition; it is retrospective. The regressors use only workload and pre-service queue inputs so target and completed timing telemetry cannot leak into regression. No component localizer is part of this version.
+
+### Two-model artifact audit and instructor report
+
+Verification command:
+
+```text
+python -c "import json,pathlib; p=pathlib.Path('..')/'LLMServingSim'/'research'/'out'/'qwen32_single_300_uniform_training'/'model_results'; s=json.loads((p/'training_summary.json').read_text()); r=s['regression']; print('models=',sorted(r)); print('classifier_features=',len(s['classifier']['features'])); print('regression_features=',len(r['features'])); print('stale_localizer_report=',(p/'localizer_report.json').exists()); print('accuracy=',s['classifier']['accuracy']); print('confusion=',s['classifier']['confusion_matrix_true_rows_healthy_faulty_pred_columns_healthy_faulty'])"
+python -m py_compile research/fault_detection/train_qwen32_binary_and_stage_regressors.py
+git diff --check
+```
+
+Exit code: 0. Exact output:
+
+```text
+models= ['counterfactual_caveat', 'counts', 'features', 'limitation', 'model', 'seed', 'split', 'stage_definitions', 'targets', 'training_condition']
+classifier_features= 21
+regression_features= 11
+stale_localizer_report= False
+accuracy= 1.0
+confusion= [[75, 0], [0, 75]]
+```
+
+Created the instructor-facing project summary at repository root as `report.md`. Claude deck brief updated to selected two-model design and current held-out results. Component localization is not included in the selected implementation.

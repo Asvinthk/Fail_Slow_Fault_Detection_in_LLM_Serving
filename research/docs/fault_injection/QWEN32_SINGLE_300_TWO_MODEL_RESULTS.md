@@ -1,4 +1,4 @@
-# Qwen3-32B 300-request three-model prototype
+# Qwen3-32B 300-request two-model prototype
 
 ## Status and scope
 
@@ -10,7 +10,7 @@ The faulty folder name says `four_faults`, but its `fault_config.json` contains 
 
 The existing exporters produced `request_training_data.csv` for both runs. Reconciliation verified 300 unique IDs in each, IDs 0–299, identical ID sets, and matching arrival time, prompt length, and requested output length for every paired request. The classifier dataset therefore contains 600 rows: 300 healthy and 300 combined-fault condition examples.
 
-Model features are restricted to prompt length, requested output length, inter-arrival gap, routing lag, and pre-service queue snapshot counts. Excluded fields include request IDs, instance IDs, absolute timestamps, labels, fault IDs/configuration, audit/ledger/manifest fields, and added-compute or counterfactual fields. Median imputation and standard scaling are fitted inside each model pipeline on the training partition only.
+The binary classifier uses the observed per-request prefill, transfer/handoff, and decode timing telemetry, together with prompt/output lengths and queue/routing context. It learns the requested healthy-versus-faulty distinction directly from measured request timing. Prediction is retrospective after those timings are available; it is not an early-warning model. Excluded fields include request IDs, instance IDs, absolute timestamps, labels as features, fault IDs/configuration, audit/ledger/manifest fields, and added-compute or counterfactual fields. Median imputation and standard scaling are fitted inside each model pipeline on the training partition only.
 
 Healthy replay stage targets are directly measured from the healthy request telemetry. We do not subtract communication deltas from faulty-run timing: the ledger provides communication-volume changes, not exact per-request healthy communication timing. The healthy run's transfer interval is zero for every request, so its transfer regressor is a degenerate constant-target baseline.
 
@@ -20,31 +20,27 @@ Logistic regression uses a reproducible 75/25 grouped holdout (seed 23), groupin
 
 | Metric | Held-out result |
 |---|---:|
-| Accuracy | 93.33% |
-| Balanced accuracy | 93.33% |
+| Accuracy | 100.00% |
+| Balanced accuracy | 100.00% |
 | Faulty precision | 100.00% |
-| Faulty recall | 86.67% |
-| Faulty F1 | 92.86% |
-| ROC AUC | 0.9877 |
+| Faulty recall | 100.00% |
+| Faulty F1 | 100.00% |
+| ROC AUC | 1.0000 |
 
 Confusion matrix (true rows; predicted columns; healthy, faulty):
 
 ```text
 [[75,  0],
- [10, 65]]
+ [ 0, 75]]
 ```
 
-This uses admission-time/workload features. It discriminates the two matched run conditions on one workload and one topology. The label is run-condition membership, not independently verified SLO violation. One trace cannot establish generalization, detection delay, or false-positive rate under unseen workload skew.
+This uses measured stage/completion timings and discriminates the two matched run conditions on one workload and one topology. The label is healthy replay versus the combined-fault run, not an independently calibrated SLO threshold. One trace cannot establish generalization, detection delay, or false-positive rate under unseen workload skew.
 
-## Model 2: three-way component localizer
+Component localization was removed from this prototype's model plan. The combined-fault runs do not isolate one culprit per request, so this work reports only healthy-versus-faulty classification and healthy-only stage-time regression. No localization model or localization metric is claimed.
 
-**Not trained.** Although the intended classes are prefill, decode, and KV transfer, these runs cannot supply valid exclusive request-level labels for all three. The configured transfer and network mechanisms and throttle co-occur. Fault audits and ledgers are batch/component-level; they do not assign a single responsible component to each request. `prefill_added_compute_share_ns` and `decode_added_compute_share_ns` are compute ledger allocations, not exclusive ground-truth cause labels. Training on them would invent labels, so no localizer metrics or model artifact are reported. A valid localization experiment needs isolated component-specific runs and an explicit request-to-fault exposure mapping.
+## Model 2: healthy-only stage-time regressors
 
-The classifier-to-localizer cascade is consequently only partially implemented: the classifier can gate a future localizer, but there is no truthful localizer to invoke for this dataset.
-
-## Model 3: healthy-only stage-time regressors
-
-Linear regressors are trained only on the 300 healthy rows. Requests are sorted by arrival time; the first 225 train and final 75 test. Each pipeline's imputer and standard scaler are fitted on its training partition only. Features are the same pre-service features listed above.
+Linear regressors are trained only on the 300 healthy rows. Requests are sorted by arrival time; the first 225 train and final 75 test. Each pipeline's imputer and standard scaler are fitted on its training partition only. Predictors contain workload and pre-service queue features only. Completed stage timings and each target are excluded from regression predictors.
 
 | Stage target | Definition | MAE (ms) | RMSE (ms) | R² | Mean baseline MAE (ms) |
 |---|---|---:|---:|---:|---:|
@@ -59,7 +55,7 @@ The decode result's high R² is associated with this workload's token-length pat
 Inputs are staged from the lab server under the ignored path `research/out/qwen32_single_300_uniform_training/`. Run from the repository root:
 
 ```powershell
-python research/fault_detection/train_qwen32_uniform_three_models.py --data-root research/out/qwen32_single_300_uniform_training --out research/out/qwen32_single_300_uniform_training/model_results --seed 23
+python research/fault_detection/train_qwen32_binary_and_stage_regressors.py --data-root research/out/qwen32_single_300_uniform_training --out research/out/qwen32_single_300_uniform_training/model_results --seed 23
 ```
 
 The command writes `training_summary.json`, classifier/regression reports, and fitted `.joblib` models under the ignored output directory. The Python trainer is committed; the paired raw outputs and fitted models remain generated data and are gitignored.
@@ -67,8 +63,9 @@ The command writes `training_summary.json`, classifier/regression reports, and f
 ## Completion status
 
 - **Complete:** data export availability, 300-ID alignment audit, leak-excluded features, binary logistic regression, healthy-only stage regressors, train-only preprocessing, held-out metrics and confusion matrix.
-- **Partial:** classifier can gate a localizer in the design, but no localizer was fit because per-request three-class labels are unsupported by the combined-fault data.
-- **Pending:** isolated prefill/decode/KV-transfer fault runs with request-level attribution; multi-seed and multi-workload evaluation; residual threshold calibration and online alarm evaluation; final submission deck/report integration and push review.
+- **Complete:** the selected two-model prototype: binary healthy-versus-faulty classification and healthy-only stage-time regression.
+- **Out of scope for this prototype:** component localization; no per-request culprit model is part of the selected design.
+- **Pending:** multi-seed and multi-workload evaluation; residual threshold calibration and online alarm evaluation; final submission deck/report integration.
 
 ## Exact command output
 
